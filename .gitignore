@@ -1,0 +1,63 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+
+# Test results and outputs
+test/similarityThresholds/threshold_test_results_*.json
+test/similarityThresholds/threshold_test_results_all_models_*.json
+test/similarityThresholds/embedding_model_comparison_*.json
+test/similarityThresholds/comprehensive_test_results_*.json
+test/similarityThresholds/threshold_test_output/
+test/similarityThresholds/*.png
+test/similarityThresholds/*.jpg
+test/similarityThresholds/*.jpeg
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker volumes and data
+docker-data/
+.docker/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
