@@ -28,6 +28,7 @@ def create_schema(client: weaviate.WeaviateClient) -> None:
             Property(name="created_at", data_type=DataType.DATE),
             Property(name="ttl_seconds", data_type=DataType.INT),
             Property(name="cache_key", data_type=DataType.TEXT),  # Redis key reference
+            Property(name="topic", data_type=DataType.TEXT),  # Topic for partitioning
         ],
         vector_index_config=Configure.VectorIndex.hnsw(
             distance_metric=VectorDistances.COSINE,

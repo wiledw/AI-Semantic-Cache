@@ -23,6 +23,7 @@ class OpenAIClient:
         chat_model: str = "gpt-4o-mini",
         max_batch_size: int = 2048,
         max_parallel_llm_calls: int = 10,
+        enable_web_search: bool = False,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._max_llm_calls = max_llm_calls
@@ -33,7 +34,27 @@ class OpenAIClient:
         self._chat_model = chat_model
         self._max_batch_size = max_batch_size
         self._max_parallel_llm_calls = max_parallel_llm_calls
+        self._enable_web_search = enable_web_search
         self._llm_semaphore = asyncio.Semaphore(max_parallel_llm_calls)
+        
+        # If web search is enabled, use search-preview model variant
+        # Note: These models may require API access approval
+        if enable_web_search:
+            if chat_model == "gpt-4o":
+                self._effective_chat_model = "gpt-4o-search-preview"
+            elif chat_model == "gpt-4o-mini":
+                self._effective_chat_model = "gpt-4o-mini-search-preview"
+            else:
+                # For other models, keep original model name
+                # Search-preview variants may not exist for all models
+                self._effective_chat_model = chat_model
+                logger.warning(
+                    "Web search enabled but model %s may not have a search-preview variant. "
+                    "Using original model. Web search may not be available.",
+                    chat_model,
+                )
+        else:
+            self._effective_chat_model = chat_model
 
     async def get_embedding(self, text: str) -> list[float]:
         response = await self._client.embeddings.create(
@@ -147,14 +168,50 @@ class OpenAIClient:
             logger.warning("LLM call limit reached. Returning fallback response.")
             return self._fallback_response, False
 
-        response = await self._client.chat.completions.create(
-            model=self._chat_model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": query},
-            ],
-        )
+        # Use search-preview model if web search is enabled
+        # These models automatically use web search when needed for time-sensitive queries
+        model_to_use = self._effective_chat_model if self._enable_web_search else self._chat_model
+        
+        if self._enable_web_search:
+            logger.info("Web search enabled (using %s) for query: %s", model_to_use, query[:50])
+
+        try:
+            # Build request parameters
+            # Search-preview models may not support all parameters (e.g., temperature)
+            request_params = {
+                "model": model_to_use,
+                "messages": [
+                    {"role": "system", "content": self._system_prompt},
+                    {"role": "user", "content": query},
+                ],
+            }
+            
+            # Only include temperature for non-search-preview models
+            # Search-preview models don't support temperature parameter
+            if "search-preview" not in model_to_use:
+                request_params["temperature"] = 0
+            
+            response = await self._client.chat.completions.create(**request_params)
+        except Exception as exc:
+            # If search-preview model fails (e.g., not available or parameter error), fall back to regular model
+            if self._enable_web_search and "gpt-4o" in model_to_use and "search-preview" in model_to_use:
+                logger.warning(
+                    "Search-preview model %s failed (may not be available or parameter incompatibility). Falling back to %s. Error: %s",
+                    model_to_use,
+                    self._chat_model,
+                    exc,
+                )
+                # Retry with regular model (which supports temperature)
+                response = await self._client.chat.completions.create(
+                    model=self._chat_model,
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": self._system_prompt},
+                        {"role": "user", "content": query},
+                    ],
+                )
+            else:
+                raise
         message = response.choices[0].message.content or ""
         return message.strip(), True
 

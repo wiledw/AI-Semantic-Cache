@@ -14,7 +14,13 @@ from app.llm.openai_client import OpenAIClient
 from app.utils.config import get_settings
 from app.utils.connection_pool import get_async_redis_client, get_weaviate_client
 from app.utils.metrics import MetricsCollector
-from app.utils.query_classification import is_time_sensitive
+from app.utils.query_classification import (
+    is_time_sensitive,
+    extract_topic_keywords,
+    extract_topic_hybrid,
+    get_query_type,
+    get_max_age_for_query_type,
+)
 from app.utils.structured_logging import get_logger, log_with_context
 
 
@@ -81,8 +87,10 @@ async def _build_clients(embedding_model: Optional[str] = None) -> tuple[Semanti
         system_prompt=settings.llm_system_prompt,
         fallback_response=settings.llm_fallback_response,
         embedding_model=embedding_model or "text-embedding-3-small",
+        chat_model=settings.chat_model,
         max_batch_size=settings.max_batch_size,
         max_parallel_llm_calls=settings.max_parallel_llm_calls,
+        enable_web_search=settings.enable_web_search,
     )
     
     # Use connection pool for Weaviate
@@ -95,6 +103,7 @@ async def _build_clients(embedding_model: Optional[str] = None) -> tuple[Semanti
         embedding_cache_ttl_seconds=settings.embedding_cache_ttl_seconds,
         weaviate_client=weaviate_client,
         use_weaviate=settings.use_weaviate and weaviate_client is not None,
+        max_age_by_query_type=settings.max_age_by_query_type,
     )
     return cache, openai_client
 
@@ -140,6 +149,12 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
     ttl_seconds = (
         settings.short_ttl_seconds if time_sensitive else settings.long_ttl_seconds
     )
+    
+    # Extract query type for age-based invalidation
+    query_type = get_query_type(query_text)
+    
+    # Initial topic extraction (keyword-based, will be refined after embedding if needed)
+    topic = extract_topic_keywords(query_text)
 
     log_with_context(
         logger,
@@ -148,6 +163,8 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
         request_id=request_id,
         operation="query",
         time_sensitive=time_sensitive,
+        topic=topic,
+        query_type=query_type,
         force_refresh=payload.forceRefresh,
     )
     await _increment_stat(redis_client, "stat:requests")
@@ -158,36 +175,49 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
 
     # Request-level caching: Check for exact match before semantic search
     if not payload.forceRefresh:
-        exact_match = await cache.get_exact_match(query_text)
+        exact_match = await cache.get_exact_match(query_text, topic=topic)
         if exact_match:
-            latency_ms = (time.time() - start_time) * 1000
-            is_hit = True
-            similarity_score = 1.0
-            operation_type = "exact_match"
-            
-            log_with_context(
-                logger,
-                logging.INFO,
-                "Exact match cache hit",
-                request_id=request_id,
-                operation=operation_type,
-                hit=True,
-                similarity=similarity_score,
-                latency_ms=latency_ms,
-            )
-            
-            await _increment_stat(redis_client, "stat:cache_hits")
-            await metrics.record_request(
-                is_hit=True,
-                latency_ms=latency_ms,
-                similarity=similarity_score,
-                operation=operation_type,
-            )
-            
-            return QueryResponse(
-                response=exact_match["response"],
-                metadata=ResponseMetadata(source="cache", similarity=1.0),
-            )
+            # Check if entry is stale before serving
+            if not cache.is_stale(exact_match, query_type):
+                latency_ms = (time.time() - start_time) * 1000
+                is_hit = True
+                similarity_score = 1.0
+                operation_type = "exact_match"
+                
+                log_with_context(
+                    logger,
+                    logging.INFO,
+                    "Exact match cache hit",
+                    request_id=request_id,
+                    operation=operation_type,
+                    hit=True,
+                    similarity=similarity_score,
+                    latency_ms=latency_ms,
+                    topic=topic,
+                )
+                
+                await _increment_stat(redis_client, "stat:cache_hits")
+                await metrics.record_request(
+                    is_hit=True,
+                    latency_ms=latency_ms,
+                    similarity=similarity_score,
+                    operation=operation_type,
+                )
+                
+                return QueryResponse(
+                    response=exact_match["response"],
+                    metadata=ResponseMetadata(source="cache", similarity=1.0),
+                )
+            else:
+                log_with_context(
+                    logger,
+                    logging.INFO,
+                    "Exact match found but entry is stale",
+                    request_id=request_id,
+                    operation="exact_match",
+                    topic=topic,
+                    query_type=query_type,
+                )
 
     try:
         embedding = await cache.get_or_create_embedding(query_text)
@@ -203,40 +233,64 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
             exception=str(exc),
         )
         raise HTTPException(status_code=502, detail="Embedding service failure.")
+    
+    # Refine topic using hybrid approach (embedding fallback if keyword extraction returned "general")
+    if topic == "general":
+        topic = await extract_topic_hybrid(query_text, query_embedding=embedding, redis_client=redis_client)
 
     if not payload.forceRefresh:
         # Use custom threshold if provided, otherwise use default
         threshold = payload.similarityThreshold if payload.similarityThreshold is not None else settings.similarity_threshold
-        entry, similarity = await cache.find_similar(embedding, threshold=threshold)
+        entry, similarity = await cache.find_similar(
+            embedding,
+            threshold=threshold,
+            topic=topic,
+            query_type=query_type,
+        )
         if entry:
-            latency_ms = (time.time() - start_time) * 1000
-            is_hit = True
-            similarity_score = similarity
-            operation_type = "semantic_search"
-            
-            log_with_context(
-                logger,
-                logging.INFO,
-                "Cache hit with similarity",
-                request_id=request_id,
-                operation=operation_type,
-                hit=True,
-                similarity=similarity_score,
-                latency_ms=latency_ms,
-            )
-            
-            await _increment_stat(redis_client, "stat:cache_hits")
-            await metrics.record_request(
-                is_hit=True,
-                latency_ms=latency_ms,
-                similarity=similarity_score,
-                operation=operation_type,
-            )
-            
-            return QueryResponse(
-                response=entry["response"],
-                metadata=ResponseMetadata(source="cache", similarity=similarity),
-            )
+            # Note: is_stale() is already checked in find_similar(), but double-check for safety
+            if not cache.is_stale(entry, query_type):
+                latency_ms = (time.time() - start_time) * 1000
+                is_hit = True
+                similarity_score = similarity
+                operation_type = "semantic_search"
+                
+                log_with_context(
+                    logger,
+                    logging.INFO,
+                    "Cache hit with similarity",
+                    request_id=request_id,
+                    operation=operation_type,
+                    hit=True,
+                    similarity=similarity_score,
+                    latency_ms=latency_ms,
+                    topic=topic,
+                    query_type=query_type,
+                )
+                
+                await _increment_stat(redis_client, "stat:cache_hits")
+                await metrics.record_request(
+                    is_hit=True,
+                    latency_ms=latency_ms,
+                    similarity=similarity_score,
+                    operation=operation_type,
+                )
+                
+                return QueryResponse(
+                    response=entry["response"],
+                    metadata=ResponseMetadata(source="cache", similarity=similarity),
+                )
+            else:
+                log_with_context(
+                    logger,
+                    logging.INFO,
+                    "Similar entry found but is stale",
+                    request_id=request_id,
+                    operation="semantic_search",
+                    similarity=similarity,
+                    topic=topic,
+                    query_type=query_type,
+                )
         
         similarity_score = similarity
         operation_type = "semantic_search"
@@ -269,7 +323,7 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=502, detail="LLM service failure.")
 
     if used_llm:
-        await cache.store_response(query_text, embedding, answer, ttl_seconds)
+        await cache.store_response(query_text, embedding, answer, ttl_seconds, topic=topic)
         log_with_context(
             logger,
             logging.INFO,
@@ -277,6 +331,7 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
             request_id=request_id,
             operation="store_response",
             ttl_seconds=ttl_seconds,
+            topic=topic,
         )
     else:
         await _increment_stat(redis_client, "stat:llm_fallbacks")
