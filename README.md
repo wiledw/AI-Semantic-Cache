@@ -41,9 +41,10 @@ Query Classification
   |  \-> Topic Extraction (keywords + embeddings)
   |  \-> Query Type Detection (for age-based invalidation)
   v
-Redis (responses + embeddings + metrics + TTL + topic partitions)
-  |
-  +-> Optional: Weaviate (vector search with topic filtering)
+Storage Layer
+  | \
+  |  \-> Redis (responses + embeddings + metrics + TTL + topic partitions)
+  |  \-> Weaviate (optional vector database with topic filtering)
 ```
 
 **Cache Flow**:
