@@ -7,6 +7,7 @@ services:
       - .env
     depends_on:
       - redis
+      - weaviate
   frontend:
     image: node:20-alpine
     working_dir: /usr/src/app
@@ -25,5 +26,18 @@ services:
       - redis_data:/data
       - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
     command: redis-server /usr/local/etc/redis/redis.conf
+  weaviate:
+    image: semitechnologies/weaviate:1.24.0
+    ports:
+      - "8080:8080"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      - DEFAULT_VECTORIZER_MODULE=none
+      - ENABLE_MODULES=text2vec-openai,text2vec-cohere,text2vec-huggingface,ref2vec-centroid,generative-openai,qna-openai
+      - CLUSTER_HOSTNAME=node1
 volumes:
   redis_data:
+  weaviate_data:

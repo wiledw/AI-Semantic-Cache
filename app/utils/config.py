@@ -36,6 +36,16 @@ class Settings:
     llm_system_prompt: str
     llm_fallback_response: str
     llm_cost_per_call: float
+    weaviate_url: str
+    weaviate_api_key: str
+    use_weaviate: bool
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes", "on")
 
 
 def get_settings() -> Settings:
@@ -56,4 +66,7 @@ def get_settings() -> Settings:
             "LLM call limit reached. Please try again later.",
         ),
         llm_cost_per_call=_get_env_float("LLM_COST_PER_CALL", 0.01),
+        weaviate_url=os.getenv("WEAVIATE_URL", "http://weaviate:8080"),
+        weaviate_api_key=os.getenv("WEAVIATE_API_KEY", ""),
+        use_weaviate=_get_env_bool("USE_WEAVIATE", False),
     )

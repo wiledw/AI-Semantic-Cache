@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from redis import Redis
 
 from app.cache.semantic_cache import SemanticCache
+from app.cache.weaviate_schema import get_weaviate_client
 from app.llm.openai_client import OpenAIClient
 from app.utils.config import get_settings
 from app.utils.query_classification import is_time_sensitive
@@ -56,11 +57,25 @@ def _build_clients(embedding_model: Optional[str] = None) -> tuple[SemanticCache
         fallback_response=settings.llm_fallback_response,
         embedding_model=embedding_model or "text-embedding-3-small",
     )
+    
+    # Initialize Weaviate client if enabled
+    weaviate_client = None
+    if settings.use_weaviate:
+        try:
+            weaviate_client = get_weaviate_client(
+                url=settings.weaviate_url,
+                api_key=settings.weaviate_api_key if settings.weaviate_api_key else None,
+            )
+        except Exception as exc:
+            logger.warning("Failed to connect to Weaviate, falling back to linear scan: %s", exc)
+    
     cache = SemanticCache(
         redis_client=redis_client,
         openai_client=openai_client,
         similarity_threshold=settings.similarity_threshold,
         embedding_cache_ttl_seconds=settings.embedding_cache_ttl_seconds,
+        weaviate_client=weaviate_client,
+        use_weaviate=settings.use_weaviate and weaviate_client is not None,
     )
     return cache, openai_client
 
