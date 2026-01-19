@@ -2,6 +2,8 @@
 
 ## System Overview
 
+<img width="1014" height="870" alt="image" src="https://github.com/user-attachments/assets/d400f24a-0fb7-446a-ba8d-a062ab8a55e2" />
+
 This service provides a semantic caching layer for an AI-powered query API. It
 uses OpenAI embeddings to identify semantically similar queries and serves cached
 responses from Redis when similarity is above a configurable threshold. If no
