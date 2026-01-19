@@ -29,7 +29,8 @@ class SemanticCache:
         self._embedding_cache_ttl_seconds = embedding_cache_ttl_seconds
 
     def get_or_create_embedding(self, query: str) -> list[float]:
-        normalized = normalize_query(query)
+        # Use enhanced preprocessing to normalize query for better cache matching
+        normalized = normalize_query(query, enhanced=True)
         # Include embedding model in cache key to avoid conflicts between models
         model_name = self._openai._embedding_model
         embed_key = f"embed:{model_name}:{self._hash_text(normalized)}"
@@ -37,7 +38,9 @@ class SemanticCache:
         if cached:
             return json.loads(cached)
 
-        embedding = self._openai.get_embedding(query)
+        # Generate embedding from normalized query to maximize similarity matching
+        # This ensures similar queries produce similar embeddings
+        embedding = self._openai.get_embedding(normalized)
         self._redis.set(
             embed_key,
             json.dumps(embedding),

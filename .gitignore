@@ -19,16 +19,6 @@ ENV/
 .venv/
 .ENV/
 
-# Test results and outputs
-test/similarityThresholds/threshold_test_results_*.json
-test/similarityThresholds/threshold_test_results_all_models_*.json
-test/similarityThresholds/embedding_model_comparison_*.json
-test/similarityThresholds/comprehensive_test_results_*.json
-test/similarityThresholds/threshold_test_output/
-test/similarityThresholds/*.png
-test/similarityThresholds/*.jpg
-test/similarityThresholds/*.jpeg
-
 # IDE and editor files
 .vscode/
 .idea/
