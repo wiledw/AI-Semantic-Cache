@@ -111,6 +111,17 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
     )
     await _increment_stat(redis_client, "stat:requests")
 
+    # Request-level caching: Check for exact match before semantic search
+    if not payload.forceRefresh:
+        exact_match = await cache.get_exact_match(query_text)
+        if exact_match:
+            logger.info("Exact match cache hit (request-level)")
+            await _increment_stat(redis_client, "stat:cache_hits")
+            return QueryResponse(
+                response=exact_match["response"],
+                metadata=ResponseMetadata(source="cache", similarity=1.0),
+            )
+
     try:
         embedding = await cache.get_or_create_embedding(query_text)
     except Exception as exc:

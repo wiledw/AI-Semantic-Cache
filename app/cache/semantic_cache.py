@@ -34,6 +34,15 @@ class SemanticCache:
         self._weaviate = weaviate_client
         self._use_weaviate = use_weaviate and weaviate_client is not None
 
+    async def get_exact_match(self, query: str) -> Optional[dict]:
+        """Check for exact query match in cache (request-level caching)."""
+        cache_key = f"cache:{self._hash_text(query)}"
+        cached = await self._redis.get(cache_key)
+        if cached:
+            entry = json.loads(cached)
+            return entry
+        return None
+
     async def get_or_create_embedding(self, query: str) -> list[float]:
         # Use enhanced preprocessing to normalize query for better cache matching
         normalized = normalize_query(query, enhanced=True)
