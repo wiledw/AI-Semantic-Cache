@@ -9,13 +9,15 @@ This service provides a semantic caching layer for an AI-powered query API. It u
 ## Features
 
 - **Semantic Caching**: Uses cosine similarity on embeddings to match semantically similar queries
+- **Time-Based Cache Invalidation**: Domain-specific age limits (weather: 1h, news: 30min, price: 30min, score: 10min) to prevent stale data
+- **Topic-Based Cache Partitioning**: Prevents cross-domain contamination by partitioning cache by topic namespace
 - **Batch Processing**: Parallel embedding generation using OpenAI's native batch API for improved throughput
 - **Parallel LLM Calls**: Concurrent LLM completions with rate limiting for high-volume scenarios
 - **Structured Logging**: JSON-formatted logs with severity levels (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - **Metrics Collection**: Time-series metrics tracking cache performance (hit rate, latency, request volume)
 - **Real-time Visualization**: Interactive charts showing cache performance over time
 - **Cost Tracking**: Estimates LLM costs and cache savings
-- **Dual Storage**: Supports Redis (default) and optional Weaviate vector database
+- **Dual Storage**: Supports Redis (default) and optional Weaviate vector database with topic filtering
 - **Request-level Caching**: Fast exact-match cache before semantic search
 - **TTL Management**: Automatic expiration based on query type (time-sensitive vs evergreen)
 - **Error Handling**: Retry logic with exponential backoff for batch operations
@@ -28,16 +30,27 @@ Client
   v
 FastAPI (/api/query)
   | \
-  |  \-> OpenAI LLM (gpt-4o-mini)
+  |  \-> OpenAI LLM (gpt-4o-mini / gpt-4o-search-preview)
   v
 Semantic Cache
   | \
   |  \-> OpenAI Embeddings (text-embedding-3-small)
   v
-Redis (responses + embeddings + metrics + TTL)
+Query Classification
+  | \
+  |  \-> Topic Extraction (keywords + embeddings)
+  |  \-> Query Type Detection (for age-based invalidation)
+  v
+Redis (responses + embeddings + metrics + TTL + topic partitions)
   |
-  +-> Optional: Weaviate (vector search)
+  +-> Optional: Weaviate (vector search with topic filtering)
 ```
+
+**Cache Flow**:
+1. Query is classified into a topic and query type
+2. Cache lookup is scoped to the topic partition
+3. Staleness check uses `min(TTL, max_age_by_domain)`
+4. If cache miss, LLM is called and response is cached with topic and TTL
 
 ## Semantic Similarity Approach
 
@@ -50,11 +63,71 @@ If the best cached entry is above the threshold and not expired, the cached resp
 
 ## Caching Strategy & TTL Logic
 
-- Cache entries include `query_text`, `embedding`, `response`, `created_at`, `ttl_seconds`.
+- Cache entries include `query_text`, `embedding`, `response`, `created_at`, `ttl_seconds`, `topic`.
 - **Time-sensitive queries** are detected via keywords: `today`, `now`, `current`, `weather`, `news`, `price`, `score`.
 - **Time-sensitive TTL**: Default 10 minutes (`SHORT_TTL_SECONDS`)
 - **Evergreen TTL**: Default 24 hours (`LONG_TTL_SECONDS`)
 - **Embedding cache TTL**: Default 7 days (`EMBEDDING_CACHE_TTL_SECONDS`)
+
+## Advanced Caching Features
+
+### Time-Based Cache Invalidation
+
+**Goal**: Avoid reusing answers that are correct but stale (prices, news, metrics, system state).
+
+The system implements domain-specific age limits to prevent serving outdated information:
+
+- **Weather**: 1 hour max age
+- **News**: 30 minutes max age
+- **Price**: 30 minutes max age
+- **Score**: 10 minutes max age
+
+**How it works**:
+- Each cached entry has both a **TTL** (time-to-live) and a **domain-specific max age**.
+- The system always invalidates based on the **earlier of the two**:
+  ```
+  effective_expiry = min(TTL, max_age_by_domain)
+  ```
+- For example, a weather query with a 10-minute TTL and 1-hour max age will expire after 10 minutes (the earlier value).
+- This ensures time-sensitive data is refreshed appropriately even if the global TTL hasn't expired.
+
+**Configuration**:
+- Set `MAX_AGE_BY_QUERY_TYPE` environment variable as a JSON object:
+  ```json
+  {
+    "weather": 3600,
+    "news": 1800,
+    "price": 1800,
+    "score": 600
+  }
+  ```
+- Values are in seconds.
+
+### Topic-Based Cache Partitioning
+
+**Goal**: Prevent semantic cross-contamination (e.g., "BTC price" accidentally matching "ETH price").
+
+The cache is partitioned by topic namespace before similarity search, ensuring queries only match entries within the same domain.
+
+**Topic Extraction**:
+- Each query is classified into a topic (e.g., "weather", "tech", "news", "price", "score", "general") using:
+  1. **Keyword matching**: First-pass routing using domain-specific keywords
+  2. **Embedding fallback**: If keyword matching returns "general", the system uses embedding-based similarity to topic centroids stored in Redis
+
+**Weaviate Integration**:
+- When using Weaviate (`USE_WEAVIATE=true`), the `topic` property is stored in the Weaviate schema
+- **Database-level filtering**: Weaviate filters by topic **before** vector search, making retrieval faster and more accurate
+- This prevents cross-domain cache reuse at the database level, improving both performance and accuracy
+
+**Benefits**:
+- **Faster retrieval**: Topic filtering happens before vector search, reducing the search space
+- **Better accuracy**: Prevents false positives from semantically similar but domain-different queries
+- **Scalability**: Topic partitioning improves performance as the cache grows
+
+**Example**:
+- Query: "What's the weather in NYC?" → Topic: `weather` → Only searches within weather partition
+- Query: "What's the price of Bitcoin?" → Topic: `price` → Only searches within price partition
+- Query: "Who was the first president?" → Topic: `general` → Searches within general partition
 
 ## Cost Control Strategy
 
@@ -99,9 +172,12 @@ Key configuration options in `.env`:
 - `MAX_BATCH_SIZE`: Maximum number of embeddings per batch request (default: `2048`)
 - `MAX_PARALLEL_LLM_CALLS`: Maximum concurrent LLM calls for parallel processing (default: `10`)
 - `USE_WEAVIATE`: Enable Weaviate vector database (default: `false`)
+- `MAX_AGE_BY_QUERY_TYPE`: JSON object mapping query types to max age in seconds (default: `{"weather": 3600, "news": 1800, "price": 1800, "score": 600}`)
 - `LOG_LEVEL`: Logging level - DEBUG, INFO, WARNING, ERROR, CRITICAL (default: `INFO`)
 - `USE_JSON_LOGGING`: Use JSON format for logs (default: `true`)
 - `LLM_COST_PER_CALL`: Cost per LLM call for estimates (default: `0.01`)
+- `ENABLE_WEB_SEARCH`: Enable web search for time-sensitive queries using OpenAI search-preview models (default: `false`)
+- `CHAT_MODEL`: OpenAI chat model to use (default: `gpt-4o-mini`)
 
 ## API Endpoints
 
