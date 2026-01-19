@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -11,10 +13,12 @@ from app.cache.semantic_cache import SemanticCache
 from app.llm.openai_client import OpenAIClient
 from app.utils.config import get_settings
 from app.utils.connection_pool import get_async_redis_client, get_weaviate_client
+from app.utils.metrics import MetricsCollector
 from app.utils.query_classification import is_time_sensitive
+from app.utils.structured_logging import get_logger, log_with_context
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter()
 settings = get_settings()
 
@@ -45,6 +49,25 @@ class StatsResponse(BaseModel):
     cache_hit_rate: float
     estimated_llm_cost: float
     estimated_cache_savings: float
+
+
+class MetricsDataPoint(BaseModel):
+    timestamp: str
+    timestamp_sec: int
+    requests: int
+    hits: int
+    misses: int
+    avg_latency_ms: float
+    hit_rate: float
+    cumulative_requests: int
+    cumulative_hits: int
+    cumulative_misses: int
+    cumulative_hit_rate: float
+
+
+class MetricsResponse(BaseModel):
+    data: list[MetricsDataPoint]
+    current_stats: dict
 
 
 async def _build_clients(embedding_model: Optional[str] = None) -> tuple[SemanticCache, OpenAIClient]:
@@ -92,31 +115,73 @@ async def _get_stat(redis_client: AsyncRedis, key: str) -> int:
 
 @router.post("/query", response_model=QueryResponse)
 async def query_endpoint(payload: QueryRequest) -> QueryResponse:
+    start_time = time.time()
+    request_id = f"req_{int(start_time * 1000)}"
+    
     if not settings.openai_api_key:
+        log_with_context(
+            logger,
+            logging.ERROR,
+            "OPENAI_API_KEY is not set",
+            request_id=request_id,
+            operation="query",
+        )
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set.")
 
     cache, openai_client = await _build_clients(embedding_model=payload.embeddingModel)
     # Use shared async Redis client from connection pool
     redis_client = await get_async_redis_client()
+    metrics = MetricsCollector(redis_client)
+    
     query_text = payload.query.strip()
     time_sensitive = is_time_sensitive(query_text)
     ttl_seconds = (
         settings.short_ttl_seconds if time_sensitive else settings.long_ttl_seconds
     )
 
-    logger.info(
-        "Incoming query. time_sensitive=%s force_refresh=%s",
-        time_sensitive,
-        payload.forceRefresh,
+    log_with_context(
+        logger,
+        logging.INFO,
+        "Incoming query",
+        request_id=request_id,
+        operation="query",
+        time_sensitive=time_sensitive,
+        force_refresh=payload.forceRefresh,
     )
     await _increment_stat(redis_client, "stat:requests")
+
+    is_hit = False
+    similarity_score: Optional[float] = None
+    operation_type = "query"
 
     # Request-level caching: Check for exact match before semantic search
     if not payload.forceRefresh:
         exact_match = await cache.get_exact_match(query_text)
         if exact_match:
-            logger.info("Exact match cache hit (request-level)")
+            latency_ms = (time.time() - start_time) * 1000
+            is_hit = True
+            similarity_score = 1.0
+            operation_type = "exact_match"
+            
+            log_with_context(
+                logger,
+                logging.INFO,
+                "Exact match cache hit",
+                request_id=request_id,
+                operation=operation_type,
+                hit=True,
+                similarity=similarity_score,
+                latency_ms=latency_ms,
+            )
+            
             await _increment_stat(redis_client, "stat:cache_hits")
+            await metrics.record_request(
+                is_hit=True,
+                latency_ms=latency_ms,
+                similarity=similarity_score,
+                operation=operation_type,
+            )
+            
             return QueryResponse(
                 response=exact_match["response"],
                 metadata=ResponseMetadata(source="cache", similarity=1.0),
@@ -125,7 +190,16 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
     try:
         embedding = await cache.get_or_create_embedding(query_text)
     except Exception as exc:
-        logger.exception("Embedding generation failed: %s", exc)
+        latency_ms = (time.time() - start_time) * 1000
+        log_with_context(
+            logger,
+            logging.ERROR,
+            "Embedding generation failed",
+            request_id=request_id,
+            operation="embedding",
+            latency_ms=latency_ms,
+            exception=str(exc),
+        )
         raise HTTPException(status_code=502, detail="Embedding service failure.")
 
     if not payload.forceRefresh:
@@ -133,13 +207,46 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
         threshold = payload.similarityThreshold if payload.similarityThreshold is not None else settings.similarity_threshold
         entry, similarity = await cache.find_similar(embedding, threshold=threshold)
         if entry:
-            logger.info("Cache hit with similarity %.4f", similarity)
+            latency_ms = (time.time() - start_time) * 1000
+            is_hit = True
+            similarity_score = similarity
+            operation_type = "semantic_search"
+            
+            log_with_context(
+                logger,
+                logging.INFO,
+                "Cache hit with similarity",
+                request_id=request_id,
+                operation=operation_type,
+                hit=True,
+                similarity=similarity_score,
+                latency_ms=latency_ms,
+            )
+            
             await _increment_stat(redis_client, "stat:cache_hits")
+            await metrics.record_request(
+                is_hit=True,
+                latency_ms=latency_ms,
+                similarity=similarity_score,
+                operation=operation_type,
+            )
+            
             return QueryResponse(
                 response=entry["response"],
                 metadata=ResponseMetadata(source="cache", similarity=similarity),
             )
-        logger.info("Cache miss. Best similarity %.4f", similarity)
+        
+        similarity_score = similarity
+        operation_type = "semantic_search"
+        log_with_context(
+            logger,
+            logging.INFO,
+            "Cache miss",
+            request_id=request_id,
+            operation=operation_type,
+            miss=True,
+            similarity=similarity_score,
+        )
         await _increment_stat(redis_client, "stat:cache_misses")
     else:
         await _increment_stat(redis_client, "stat:cache_misses")
@@ -147,14 +254,45 @@ async def query_endpoint(payload: QueryRequest) -> QueryResponse:
     try:
         answer, used_llm = await openai_client.get_completion(query_text)
     except Exception as exc:
-        logger.exception("LLM call failed: %s", exc)
+        latency_ms = (time.time() - start_time) * 1000
+        log_with_context(
+            logger,
+            logging.ERROR,
+            "LLM call failed",
+            request_id=request_id,
+            operation="llm_call",
+            latency_ms=latency_ms,
+            exception=str(exc),
+        )
         raise HTTPException(status_code=502, detail="LLM service failure.")
 
     if used_llm:
         await cache.store_response(query_text, embedding, answer, ttl_seconds)
+        log_with_context(
+            logger,
+            logging.INFO,
+            "Stored response in cache",
+            request_id=request_id,
+            operation="store_response",
+            ttl_seconds=ttl_seconds,
+        )
     else:
         await _increment_stat(redis_client, "stat:llm_fallbacks")
-        logger.warning("Fallback response returned due to LLM call cap.")
+        log_with_context(
+            logger,
+            logging.WARNING,
+            "Fallback response returned due to LLM call cap",
+            request_id=request_id,
+            operation="fallback",
+        )
+
+    latency_ms = (time.time() - start_time) * 1000
+    await metrics.record_request(
+        is_hit=False,
+        latency_ms=latency_ms,
+        similarity=similarity_score,
+        operation=operation_type,
+    )
 
     source = openai_client.chat_model if used_llm else "fallback"
     return QueryResponse(
@@ -185,4 +323,37 @@ async def stats_endpoint() -> StatsResponse:
         cache_hit_rate=hit_rate,
         estimated_llm_cost=estimated_cost,
         estimated_cache_savings=estimated_savings,
+    )
+
+
+@router.get("/metrics", response_model=MetricsResponse)
+async def metrics_endpoint(
+    hours: int = 1,
+    interval_seconds: int = 10,
+) -> MetricsResponse:
+    """Get time-series metrics data for cache performance visualization.
+    
+    Args:
+        hours: Number of hours of data to retrieve (default: 1)
+        interval_seconds: Aggregation interval in seconds (default: 60)
+    """
+    from datetime import timedelta
+    
+    redis_client = await get_async_redis_client()
+    metrics = MetricsCollector(redis_client)
+    
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours)
+    
+    time_series_data = await metrics.get_time_series_data(
+        start_time=start_time,
+        end_time=end_time,
+        interval_seconds=interval_seconds,
+    )
+    
+    current_stats = await metrics.get_current_stats()
+    
+    return MetricsResponse(
+        data=[MetricsDataPoint(**point) for point in time_series_data],
+        current_stats=current_stats,
     )

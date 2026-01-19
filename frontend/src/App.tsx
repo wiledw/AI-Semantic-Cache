@@ -1,4 +1,14 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from "recharts";
 
 type ApiResponse = {
   response: string;
@@ -19,6 +29,31 @@ type StatsResponse = {
   estimated_cache_savings: number;
 };
 
+type MetricsDataPoint = {
+  timestamp: string;
+  timestamp_sec: number;
+  requests: number;
+  hits: number;
+  misses: number;
+  avg_latency_ms: number;
+  hit_rate: number;
+  cumulative_requests: number;
+  cumulative_hits: number;
+  cumulative_misses: number;
+  cumulative_hit_rate: number;
+};
+
+type MetricsResponse = {
+  data: MetricsDataPoint[];
+  current_stats: {
+    total_requests: number;
+    total_hits: number;
+    total_misses: number;
+    hit_rate: number;
+    avg_latency_ms: number;
+  };
+};
+
 const DEFAULT_QUERY =
   "How to update my password?";
 
@@ -28,6 +63,9 @@ const API_URL =
 const STATS_URL =
   (import.meta as ImportMeta & { env: { VITE_STATS_URL?: string } }).env
     .VITE_STATS_URL ?? "http://localhost:3000/api/stats";
+const METRICS_URL =
+  (import.meta as ImportMeta & { env: { VITE_METRICS_URL?: string } }).env
+    .VITE_METRICS_URL ?? "http://localhost:3000/api/metrics";
 
 export default function App() {
   const [query, setQuery] = useState(DEFAULT_QUERY);
@@ -36,6 +74,7 @@ export default function App() {
   const [result, setResult] = useState<ApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
   const [textareaFocused, setTextareaFocused] = useState(false);
   const [buttonHovered, setButtonHovered] = useState(false);
 
@@ -49,6 +88,29 @@ export default function App() {
       setStats(data);
     } catch {
       // Ignore stats errors to avoid blocking UI.
+    }
+  };
+
+  const fetchMetrics = async () => {
+    try {
+      // Use smaller interval (10 seconds) for better granularity
+      // This allows multiple requests per interval, showing intermediate hit rates
+      const response = await fetch(`${METRICS_URL}?hours=1&interval_seconds=10`);
+      if (!response.ok) {
+        console.warn('Metrics fetch failed:', response.status, response.statusText);
+        return;
+      }
+      const data = (await response.json()) as MetricsResponse;
+      console.log('Metrics data received:', data);
+      if (data.data && data.data.length > 0) {
+        console.log('First data point:', data.data[0]);
+      } else {
+        console.warn('No metrics data points available');
+      }
+      setMetrics(data);
+    } catch (error) {
+      console.error('Error fetching metrics:', error);
+      // Ignore metrics errors to avoid blocking UI.
     }
   };
 
@@ -73,6 +135,7 @@ export default function App() {
       const data = (await response.json()) as ApiResponse;
       setResult(data);
       fetchStats();
+      fetchMetrics();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
@@ -80,10 +143,15 @@ export default function App() {
     }
   };
 
-  React.useEffect(() => {
+  useEffect(() => {
     fetchStats();
-    const interval = window.setInterval(fetchStats, 5000);
-    return () => window.clearInterval(interval);
+    fetchMetrics();
+    const statsInterval = window.setInterval(fetchStats, 5000);
+    const metricsInterval = window.setInterval(fetchMetrics, 10000);
+    return () => {
+      window.clearInterval(statsInterval);
+      window.clearInterval(metricsInterval);
+    };
   }, []);
 
   return (
@@ -205,6 +273,119 @@ export default function App() {
               <p style={styles.placeholder}>Loading stats...</p>
             )}
           </div>
+
+          {metrics && (
+            <div style={styles.chartCard}>
+              <h2 style={styles.sectionTitle}>
+                📈 Cache Performance Over Time
+              </h2>
+              {metrics.data && metrics.data.length > 0 ? (
+                <>
+                  <p style={styles.chartDescription}>
+                    Showing cumulative hit rate and total requests over time (10-second intervals). As more queries are cached, the cumulative hit rate should increase. The request count accumulates over time.
+                  </p>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <LineChart data={metrics.data}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis
+                        dataKey="timestamp"
+                        tickFormatter={(value) => {
+                          const date = new Date(value);
+                          return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        }}
+                        stroke="#64748b"
+                        style={{ fontSize: '12px' }}
+                      />
+                      <YAxis
+                        yAxisId="left"
+                        stroke="#667eea"
+                        style={{ fontSize: '12px' }}
+                        label={{ value: 'Hit Rate (%)', angle: -90, position: 'insideLeft', style: { fill: '#667eea' } }}
+                      />
+                      <YAxis
+                        yAxisId="right"
+                        orientation="right"
+                        stroke="#10b981"
+                        style={{ fontSize: '12px' }}
+                        label={{ value: 'Total Requests', angle: 90, position: 'insideRight', style: { fill: '#10b981' } }}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: '#ffffff',
+                          border: '1px solid #e2e8f0',
+                          borderRadius: '8px',
+                          padding: '8px',
+                        }}
+                        formatter={(value: any, name?: string) => {
+                          if (name === 'cumulative_hit_rate') {
+                            return [`${(value * 100).toFixed(1)}%`, 'Cumulative Hit Rate'];
+                          }
+                          if (name === 'cumulative_requests') {
+                            return [value, 'Total Requests'];
+                          }
+                          if (name === 'hit_rate') {
+                            return [`${(value * 100).toFixed(1)}%`, 'Interval Hit Rate'];
+                          }
+                          if (name === 'requests') {
+                            return [value, 'Interval Requests'];
+                          }
+                          return [value, name || ''];
+                        }}
+                        labelFormatter={(value) => {
+                          const date = new Date(value);
+                          return date.toLocaleString();
+                        }}
+                      />
+                      <Legend
+                        wrapperStyle={{ paddingTop: '20px' }}
+                        iconType="line"
+                      />
+                      <Line
+                        yAxisId="left"
+                        type="monotone"
+                        dataKey="cumulative_hit_rate"
+                        name="Cumulative Hit Rate"
+                        stroke="#667eea"
+                        strokeWidth={2}
+                        dot={{ r: 3 }}
+                        activeDot={{ r: 5 }}
+                      />
+                      <Line
+                        yAxisId="right"
+                        type="monotone"
+                        dataKey="cumulative_requests"
+                        name="Total Requests"
+                        stroke="#10b981"
+                        strokeWidth={2}
+                        dot={{ r: 3 }}
+                        activeDot={{ r: 5 }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </>
+              ) : (
+                <p style={styles.placeholder}>
+                  No metrics data available yet. Send some queries to see cache performance over time.
+                </p>
+              )}
+              {metrics?.current_stats && (
+                <div style={styles.metricsSummary}>
+                  <div style={styles.metricSummaryItem}>
+                    <span style={styles.metricSummaryLabel}>Avg Latency:</span>
+                    <span style={styles.metricSummaryValue}>
+                      {metrics.current_stats.avg_latency_ms.toFixed(2)}ms
+                    </span>
+                  </div>
+                  <div style={styles.metricSummaryItem}>
+                    <span style={styles.metricSummaryLabel}>Overall Hit Rate:</span>
+                    <span style={styles.metricSummaryValue}>
+                      {(metrics.current_stats.hit_rate * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {error && (
             <div style={styles.error}>
               <span>⚠️</span>
@@ -462,5 +643,43 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
     gap: 8,
     boxShadow: "0 2px 8px rgba(220, 38, 38, 0.15)",
+  },
+  chartCard: {
+    background: "linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%)",
+    borderRadius: 16,
+    padding: "24px",
+    border: "1px solid #e2e8f0",
+    marginBottom: 24,
+    boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+  },
+  chartDescription: {
+    margin: "0 0 20px",
+    color: "#64748b",
+    fontSize: 14,
+    lineHeight: 1.6,
+  },
+  metricsSummary: {
+    display: "flex",
+    gap: 24,
+    marginTop: 16,
+    paddingTop: 16,
+    borderTop: "1px solid #e2e8f0",
+  },
+  metricSummaryItem: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+  },
+  metricSummaryLabel: {
+    fontSize: 12,
+    color: "#64748b",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    fontWeight: 600,
+  },
+  metricSummaryValue: {
+    fontSize: 18,
+    fontWeight: 700,
+    color: "#1e293b",
   },
 };

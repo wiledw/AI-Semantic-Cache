@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -8,14 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.utils.connection_pool import get_redis_client, get_async_redis_client, get_weaviate_client, close_connections
+from app.utils.structured_logging import setup_structured_logging, get_logger
 
+# Setup structured logging
+log_level = os.getenv("LOG_LEVEL", "INFO")
+use_json_logging = os.getenv("USE_JSON_LOGGING", "true").lower() == "true"
+setup_structured_logging(level=log_level, use_json=use_json_logging)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @asynccontextmanager

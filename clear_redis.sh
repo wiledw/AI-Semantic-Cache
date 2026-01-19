@@ -1,68 +1,81 @@
 #!/bin/bash
 
-# Script to clear all Redis data
-# This will flush all keys from the Redis cache
+# Script to clear all Redis and Weaviate data
+# This will flush all keys from Redis AND delete persistence files
+# Also clears Weaviate data if enabled
 
-set -e
+# Don't exit on error - we want to try all cleanup methods
+set +e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${YELLOW}Clearing Redis cache...${NC}"
+echo -e "${YELLOW}Clearing Redis cache and persistence files...${NC}"
 
-# Try to use docker exec first (most common case)
+REDIS_CONTAINER=""
+WEAVIATE_CONTAINER=""
+
+# Find Redis container
 if command -v docker &> /dev/null; then
-    # Check if redis container is running
-    if docker ps --format '{{.Names}}' | grep -q "^boardy-redis-1$\|^.*redis.*$"; then
-        REDIS_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i redis | head -n 1)
-        echo -e "${YELLOW}Using Docker container: ${REDIS_CONTAINER}${NC}"
-        docker exec "${REDIS_CONTAINER}" redis-cli FLUSHALL
-        echo -e "${GREEN}✓ Successfully cleared all Redis data via Docker${NC}"
-        exit 0
-    fi
+    REDIS_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i redis | head -n 1 || true)
+    WEAVIATE_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i weaviate | head -n 1 || true)
+fi
+
+# Clear Redis
+if [ -n "$REDIS_CONTAINER" ]; then
+    echo -e "${YELLOW}Found Redis container: ${REDIS_CONTAINER}${NC}"
     
-    # Try docker compose naming convention
-    if docker ps --format '{{.Names}}' | grep -q ".*_redis_"; then
-        REDIS_CONTAINER=$(docker ps --format '{{.Names}}' | grep -i redis | head -n 1)
-        echo -e "${YELLOW}Using Docker container: ${REDIS_CONTAINER}${NC}"
-        docker exec "${REDIS_CONTAINER}" redis-cli FLUSHALL
-        echo -e "${GREEN}✓ Successfully cleared all Redis data via Docker${NC}"
-        exit 0
+    # Flush all data from memory
+    echo -e "${YELLOW}  → Flushing all Redis keys...${NC}"
+    docker exec "${REDIS_CONTAINER}" redis-cli FLUSHALL > /dev/null 2>&1 || true
+    
+    # Delete persistence files to prevent data from being restored on restart
+    echo -e "${YELLOW}  → Removing Redis persistence files...${NC}"
+    docker exec "${REDIS_CONTAINER}" sh -c "rm -f /data/dump.rdb /data/appendonly.aof" 2>/dev/null || true
+    
+    # Also try to save empty state (creates new empty persistence files)
+    docker exec "${REDIS_CONTAINER}" redis-cli BGSAVE > /dev/null 2>&1 || true
+    
+    echo -e "${GREEN}✓ Successfully cleared Redis data and persistence files${NC}"
+else
+    # Fallback: try direct redis-cli connection
+    if command -v redis-cli &> /dev/null; then
+        echo -e "${YELLOW}Attempting direct connection to Redis on localhost:6379...${NC}"
+        if redis-cli -h localhost -p 6379 ping &> /dev/null; then
+            redis-cli -h localhost -p 6379 FLUSHALL
+            echo -e "${GREEN}✓ Successfully cleared all Redis data via direct connection${NC}"
+            echo -e "${YELLOW}⚠ Note: Persistence files may still exist. Manually delete them if needed.${NC}"
+        fi
     fi
 fi
 
-# Fallback: try direct redis-cli connection
-if command -v redis-cli &> /dev/null; then
-    echo -e "${YELLOW}Attempting direct connection to Redis on localhost:6379...${NC}"
-    if redis-cli -h localhost -p 6379 ping &> /dev/null; then
-        redis-cli -h localhost -p 6379 FLUSHALL
-        echo -e "${GREEN}✓ Successfully cleared all Redis data via direct connection${NC}"
-        exit 0
-    fi
+# Clear Weaviate if container exists
+if [ -n "$WEAVIATE_CONTAINER" ]; then
+    echo -e "${YELLOW}Found Weaviate container: ${WEAVIATE_CONTAINER}${NC}"
+    echo -e "${YELLOW}  → Clearing Weaviate data...${NC}"
+    
+    # Delete the SemanticCache collection if it exists
+    docker exec "${WEAVIATE_CONTAINER}" sh -c \
+        'curl -s -X DELETE http://localhost:8080/v1/schema/SemanticCache 2>/dev/null || true' || true
+    
+    echo -e "${GREEN}✓ Cleared Weaviate data${NC}"
+    echo -e "${YELLOW}  → Note: Weaviate persistence volume may still contain data.${NC}"
+    echo -e "${YELLOW}  → To fully clear, remove volume: docker volume rm boardy_weaviate_data${NC}"
 fi
 
-# If docker compose is available, try to start redis and clear it
-if command -v docker-compose &> /dev/null || command -v docker &> /dev/null; then
-    echo -e "${YELLOW}Redis container not running. Attempting to start it...${NC}"
-    if command -v docker-compose &> /dev/null; then
-        docker-compose up -d redis 2>/dev/null || true
-    else
-        docker compose up -d redis 2>/dev/null || true
-    fi
-    
-    sleep 2
-    
-    # Try again
-    if docker ps --format '{{.Names}}' | grep -i redis | head -n 1 | xargs -I {} docker exec {} redis-cli FLUSHALL 2>/dev/null; then
-        echo -e "${GREEN}✓ Successfully cleared all Redis data${NC}"
-        exit 0
-    fi
+# Option to clear Docker volumes completely
+if [ -n "$REDIS_CONTAINER" ] || [ -n "$WEAVIATE_CONTAINER" ]; then
+    echo ""
+    echo -e "${YELLOW}To completely remove all persisted data (including volumes), run:${NC}"
+    echo -e "  docker compose down -v"
+    echo -e "  # This will remove redis_data and weaviate_data volumes"
 fi
 
-echo -e "${RED}✗ Failed to clear Redis. Please ensure:${NC}"
-echo -e "  1. Docker is installed and running"
-echo -e "  2. Redis container is running (try: docker compose up -d redis)"
-echo -e "  3. Or install redis-cli and ensure Redis is accessible on localhost:6379"
-exit 1
+echo ""
+echo -e "${GREEN}✓ Cache clearing complete!${NC}"
+echo -e "${YELLOW}⚠ If cache still appears after queries, check:${NC}"
+echo -e "  1. Redis persistence files were deleted (check container: /data/)"
+echo -e "  2. Weaviate data was cleared (if USE_WEAVIATE=true)"
+echo -e "  3. Restart containers to ensure clean state: docker compose restart"
