@@ -2,7 +2,7 @@
 
 ## System Overview
 
-<img width="1014" height="870" alt="image" src="https://github.com/user-attachments/assets/d400f24a-0fb7-446a-ba8d-a062ab8a55e2" />
+<img width="1526" height="1700" alt="image" src="https://github.com/user-attachments/assets/25de4bff-6ec8-4dc1-8c0c-0405ba985bd5" />
 
 This service provides a semantic caching layer for an AI-powered query API. It
 uses OpenAI embeddings to identify semantically similar queries and serves cached
