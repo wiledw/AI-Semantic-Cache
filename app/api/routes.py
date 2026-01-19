@@ -81,6 +81,8 @@ async def _build_clients(embedding_model: Optional[str] = None) -> tuple[Semanti
         system_prompt=settings.llm_system_prompt,
         fallback_response=settings.llm_fallback_response,
         embedding_model=embedding_model or "text-embedding-3-small",
+        max_batch_size=settings.max_batch_size,
+        max_parallel_llm_calls=settings.max_parallel_llm_calls,
     )
     
     # Use connection pool for Weaviate

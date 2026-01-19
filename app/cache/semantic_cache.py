@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -62,6 +63,83 @@ class SemanticCache:
             ex=self._embedding_cache_ttl_seconds,
         )
         return embedding
+
+    async def get_or_create_embeddings_batch(self, queries: list[str]) -> list[list[float]]:
+        """Efficiently get or create embeddings for multiple queries.
+        
+        This method optimizes the process by:
+        1. Checking cache for all queries in parallel
+        2. Identifying which embeddings need generation
+        3. Batch generating missing embeddings in a single API call
+        4. Caching all new embeddings
+        5. Returning all embeddings in order
+        
+        Args:
+            queries: List of query strings to get embeddings for
+            
+        Returns:
+            List of embedding vectors, one per input query, in the same order
+        """
+        if not queries:
+            return []
+        
+        # Normalize all queries
+        normalized_queries = [normalize_query(query, enhanced=True) for query in queries]
+        model_name = self._openai.embedding_model
+        
+        # Build cache keys for all queries
+        cache_keys = [
+            f"embed:{model_name}:{self._hash_text(norm)}"
+            for norm in normalized_queries
+        ]
+        
+        # Check cache for all queries in parallel
+        cached_results = await asyncio.gather(*[
+            self._redis.get(key) for key in cache_keys
+        ])
+        
+        # Identify which embeddings need generation
+        embeddings_to_generate = []
+        indices_to_generate = []
+        result_embeddings = [None] * len(queries)
+        
+        for i, cached in enumerate(cached_results):
+            if cached:
+                result_embeddings[i] = json.loads(cached)
+            else:
+                embeddings_to_generate.append(normalized_queries[i])
+                indices_to_generate.append(i)
+        
+        # Batch generate missing embeddings if any
+        if embeddings_to_generate:
+            logger.info(
+                "Cache miss for %d/%d embeddings. Generating batch...",
+                len(embeddings_to_generate),
+                len(queries),
+            )
+            new_embeddings = await self._openai.get_embeddings_batch(embeddings_to_generate)
+            
+            # Cache new embeddings and populate results
+            cache_tasks = []
+            for idx, embedding in zip(indices_to_generate, new_embeddings):
+                result_embeddings[idx] = embedding
+                cache_key = cache_keys[idx]
+                cache_tasks.append(
+                    self._redis.set(
+                        cache_key,
+                        json.dumps(embedding),
+                        ex=self._embedding_cache_ttl_seconds,
+                    )
+                )
+            
+            # Cache all new embeddings in parallel
+            await asyncio.gather(*cache_tasks)
+            logger.info("Cached %d new embeddings", len(new_embeddings))
+        else:
+            logger.info("All %d embeddings found in cache", len(queries))
+        
+        # Return embeddings in order (all should be populated now)
+        return result_embeddings
 
     async def find_similar(self, query_embedding: list[float], threshold: Optional[float] = None) -> tuple[Optional[dict], float]:
         """Find similar cached entry. Optionally override threshold for testing."""

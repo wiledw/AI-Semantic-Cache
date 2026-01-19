@@ -9,6 +9,8 @@ This service provides a semantic caching layer for an AI-powered query API. It u
 ## Features
 
 - **Semantic Caching**: Uses cosine similarity on embeddings to match semantically similar queries
+- **Batch Processing**: Parallel embedding generation using OpenAI's native batch API for improved throughput
+- **Parallel LLM Calls**: Concurrent LLM completions with rate limiting for high-volume scenarios
 - **Structured Logging**: JSON-formatted logs with severity levels (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - **Metrics Collection**: Time-series metrics tracking cache performance (hit rate, latency, request volume)
 - **Real-time Visualization**: Interactive charts showing cache performance over time
@@ -16,6 +18,7 @@ This service provides a semantic caching layer for an AI-powered query API. It u
 - **Dual Storage**: Supports Redis (default) and optional Weaviate vector database
 - **Request-level Caching**: Fast exact-match cache before semantic search
 - **TTL Management**: Automatic expiration based on query type (time-sensitive vs evergreen)
+- **Error Handling**: Retry logic with exponential backoff for batch operations
 
 ## Architecture Diagram
 
@@ -93,6 +96,8 @@ Key configuration options in `.env`:
 - `OPENAI_API_KEY`: Your OpenAI API key (required)
 - `SIMILARITY_THRESHOLD`: Similarity threshold for cache matching (default: `0.85`)
 - `MAX_LLM_CALLS`: Maximum LLM calls allowed (default: `100`)
+- `MAX_BATCH_SIZE`: Maximum number of embeddings per batch request (default: `2048`)
+- `MAX_PARALLEL_LLM_CALLS`: Maximum concurrent LLM calls for parallel processing (default: `10`)
 - `USE_WEAVIATE`: Enable Weaviate vector database (default: `false`)
 - `LOG_LEVEL`: Logging level - DEBUG, INFO, WARNING, ERROR, CRITICAL (default: `INFO`)
 - `USE_JSON_LOGGING`: Use JSON format for logs (default: `true`)
@@ -372,12 +377,48 @@ See `test/similarityThresholds/README.md` for details.
 - **Linear scan**: Simple and correct for small scale, but slower at large scale
 - **Weaviate**: Faster vector search but adds complexity and infrastructure
 
+## Performance Optimizations
+
+### Batch Processing
+
+The service includes optimized batch processing for high-throughput scenarios:
+
+- **Batch Embeddings**: Uses OpenAI's native batch API to process up to 2048 texts in a single request, reducing API round trips and improving latency
+- **Parallel LLM Calls**: Concurrent LLM completions with semaphore-based rate limiting to prevent API limit violations
+- **Parallel Cache Lookups**: Batch embedding retrieval checks cache for multiple queries in parallel before generating missing embeddings
+- **Retry Logic**: Exponential backoff retry mechanism for batch operations to handle transient failures
+
+### Configuration
+
+Tune performance via environment variables:
+- `MAX_BATCH_SIZE`: Controls maximum embeddings per batch (default: 2048, OpenAI's limit)
+- `MAX_PARALLEL_LLM_CALLS`: Limits concurrent LLM calls to prevent rate limiting (default: 10)
+
+### Usage
+
+Batch methods are automatically used internally for optimal performance. For custom implementations:
+
+```python
+# Batch embeddings (single API call)
+embeddings = await openai_client.get_embeddings_batch(["text1", "text2", "text3"])
+
+# Parallel embeddings (multiple concurrent calls)
+embeddings = await openai_client.get_embeddings_parallel(["text1", "text2", "text3"])
+
+# Batch LLM completions (parallel calls with rate limiting)
+results = await openai_client.get_completions_batch(["query1", "query2", "query3"])
+
+# Batch cache lookup (optimized cache + batch generation)
+embeddings = await cache.get_or_create_embeddings_batch(["query1", "query2", "query3"])
+```
+
 ## Scaling Discussion
 
 - For higher throughput, use Weaviate vector search (set `USE_WEAVIATE=true`)
-- Move metrics to a dedicated time-series database (e.g., InfluxDB, TimescaleDB)
-- Add request-level caching and batching if traffic grows
+- Batch processing is enabled by default for optimal performance
+- Move metrics to a dedicated time-series database (e.g., InfluxDB, TimescaleDB) for large-scale deployments
 - Consider distributed caching for multi-instance deployments
+- Adjust `MAX_PARALLEL_LLM_CALLS` based on your OpenAI rate limits
 
 ## Troubleshooting
 

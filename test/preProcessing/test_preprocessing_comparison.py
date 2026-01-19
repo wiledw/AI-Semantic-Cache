@@ -3,6 +3,7 @@
 Test script to compare basic vs enhanced preprocessing
 """
 
+import asyncio
 import os
 import sys
 from dotenv import load_dotenv
@@ -13,7 +14,7 @@ from app.llm.openai_client import OpenAIClient
 from app.utils.similarity import cosine_similarity, normalize_query
 from app.utils.config import get_settings
 
-def test_query_pair(query1: str, query2: str, enhanced: bool = True):
+async def test_query_pair(query1: str, query2: str, enhanced: bool = True):
     """Test similarity between two queries with different preprocessing"""
     settings = get_settings()
     
@@ -24,15 +25,17 @@ def test_query_pair(query1: str, query2: str, enhanced: bool = True):
         system_prompt="",
         fallback_response="",
         embedding_model="text-embedding-3-small",
+        max_batch_size=settings.max_batch_size,
+        max_parallel_llm_calls=settings.max_parallel_llm_calls,
     )
     
     # Normalize queries
     norm1 = normalize_query(query1, enhanced=enhanced)
     norm2 = normalize_query(query2, enhanced=enhanced)
     
-    # Generate embeddings
-    emb1 = openai_client.get_embedding(norm1)
-    emb2 = openai_client.get_embedding(norm2)
+    # Generate embeddings using batch method for efficiency
+    embeddings = await openai_client.get_embeddings_batch([norm1, norm2])
+    emb1, emb2 = embeddings[0], embeddings[1]
     
     # Calculate similarity
     similarity = cosine_similarity(emb1, emb2)
@@ -46,7 +49,7 @@ def test_query_pair(query1: str, query2: str, enhanced: bool = True):
         "enhanced": enhanced
     }
 
-def main():
+async def main():
     load_dotenv()
     
     settings = get_settings()
@@ -75,10 +78,10 @@ def main():
         print("-" * 100)
         
         # Test with basic preprocessing
-        basic_result = test_query_pair(query1, query2, enhanced=False)
+        basic_result = await test_query_pair(query1, query2, enhanced=False)
         
         # Test with enhanced preprocessing
-        enhanced_result = test_query_pair(query1, query2, enhanced=True)
+        enhanced_result = await test_query_pair(query1, query2, enhanced=True)
         
         improvement = enhanced_result["similarity"] - basic_result["similarity"]
         
@@ -142,4 +145,4 @@ def main():
         print("❌ Enhanced preprocessing does not improve similarity")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

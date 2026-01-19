@@ -39,6 +39,8 @@ class Settings:
     weaviate_url: str
     weaviate_api_key: str
     use_weaviate: bool
+    max_batch_size: int
+    max_parallel_llm_calls: int
 
 
 def _get_env_bool(name: str, default: bool) -> bool:
@@ -69,4 +71,6 @@ def get_settings() -> Settings:
         weaviate_url=os.getenv("WEAVIATE_URL", "http://weaviate:8080"),
         weaviate_api_key=os.getenv("WEAVIATE_API_KEY", ""),
         use_weaviate=_get_env_bool("USE_WEAVIATE", False),
+        max_batch_size=_get_env_int("MAX_BATCH_SIZE", 2048),
+        max_parallel_llm_calls=_get_env_int("MAX_PARALLEL_LLM_CALLS", 10),
     )

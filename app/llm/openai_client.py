@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -20,6 +21,8 @@ class OpenAIClient:
         fallback_response: str,
         embedding_model: str = "text-embedding-3-small",
         chat_model: str = "gpt-4o-mini",
+        max_batch_size: int = 2048,
+        max_parallel_llm_calls: int = 10,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._max_llm_calls = max_llm_calls
@@ -28,6 +31,9 @@ class OpenAIClient:
         self._fallback_response = fallback_response
         self._embedding_model = embedding_model
         self._chat_model = chat_model
+        self._max_batch_size = max_batch_size
+        self._max_parallel_llm_calls = max_parallel_llm_calls
+        self._llm_semaphore = asyncio.Semaphore(max_parallel_llm_calls)
 
     async def get_embedding(self, text: str) -> list[float]:
         response = await self._client.embeddings.create(
@@ -35,6 +41,106 @@ class OpenAIClient:
             input=text,
         )
         return list(response.data[0].embedding)
+
+    async def get_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts in a single batch API call.
+        
+        This is more efficient than parallel calls since OpenAI optimizes batch processing.
+        Uses OpenAI's native batch support which accepts multiple inputs in one request.
+        
+        Args:
+            texts: List of texts to generate embeddings for
+            
+        Returns:
+            List of embedding vectors, one per input text
+            
+        Raises:
+            Exception: If the batch API call fails
+        """
+        if not texts:
+            return []
+        
+        # OpenAI allows up to 2048 inputs per batch, but we'll respect max_batch_size
+        batch_size = min(len(texts), self._max_batch_size)
+        texts_to_process = texts[:batch_size]
+        
+        if len(texts) > batch_size:
+            logger.warning(
+                "Batch size (%d) exceeds max_batch_size (%d). Processing first %d texts.",
+                len(texts),
+                self._max_batch_size,
+                batch_size,
+            )
+        
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                response = await self._client.embeddings.create(
+                    model=self._embedding_model,
+                    input=texts_to_process,
+                )
+                # Extract embeddings in order
+                embeddings = [list(item.embedding) for item in response.data]
+                logger.info("Generated %d embeddings in batch", len(embeddings))
+                return embeddings
+            except Exception as exc:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "Batch embedding attempt %d/%d failed: %s. Retrying in %.1fs...",
+                        attempt + 1,
+                        max_retries,
+                        exc,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("Batch embedding failed after %d attempts: %s", max_retries, exc)
+                    raise
+
+    async def get_embeddings_parallel(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts using parallel async calls.
+        
+        Useful when you need results immediately and can't wait for batch processing.
+        Each text is processed in a separate API call, but calls are made concurrently.
+        
+        Args:
+            texts: List of texts to generate embeddings for
+            
+        Returns:
+            List of embedding vectors, one per input text
+        """
+        if not texts:
+            return []
+        
+        async def get_single_embedding(text: str) -> list[float]:
+            max_retries = 3
+            base_delay = 0.5
+            
+            for attempt in range(max_retries):
+                try:
+                    return await self.get_embedding(text)
+                except Exception as exc:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            "Embedding attempt %d/%d failed for text (length: %d): %s. Retrying in %.1fs...",
+                            attempt + 1,
+                            max_retries,
+                            len(text),
+                            exc,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error("Embedding failed after %d attempts: %s", max_retries, exc)
+                        raise
+        
+        embeddings = await asyncio.gather(*[get_single_embedding(text) for text in texts])
+        logger.info("Generated %d embeddings in parallel", len(embeddings))
+        return embeddings
 
     async def get_completion(self, query: str) -> tuple[str, bool]:
         if not await self._can_make_llm_call():
@@ -51,6 +157,51 @@ class OpenAIClient:
         )
         message = response.choices[0].message.content or ""
         return message.strip(), True
+
+    async def get_completions_batch(self, queries: list[str]) -> list[tuple[str, bool]]:
+        """Generate completions for multiple queries using parallel async calls.
+        
+        Uses asyncio.gather() to make multiple LLM calls concurrently, respecting
+        rate limits via semaphore and max_llm_calls limit.
+        
+        Args:
+            queries: List of query strings to generate completions for
+            
+        Returns:
+            List of (response, used_llm) tuples, one per query
+        """
+        if not queries:
+            return []
+        
+        async def get_single_completion(query: str) -> tuple[str, bool]:
+            """Get completion for a single query with semaphore-based rate limiting."""
+            async with self._llm_semaphore:
+                max_retries = 3
+                base_delay = 1.0
+                
+                for attempt in range(max_retries):
+                    try:
+                        return await self.get_completion(query)
+                    except Exception as exc:
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning(
+                                "LLM completion attempt %d/%d failed for query (length: %d): %s. Retrying in %.1fs...",
+                                attempt + 1,
+                                max_retries,
+                                len(query),
+                                exc,
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.error("LLM completion failed after %d attempts: %s", max_retries, exc)
+                            # Return fallback response on final failure
+                            return self._fallback_response, False
+        
+        results = await asyncio.gather(*[get_single_completion(query) for query in queries])
+        logger.info("Generated %d completions in parallel", len(results))
+        return results
 
     @property
     def chat_model(self) -> str:
