@@ -7,6 +7,8 @@ from typing import Optional
 from openai import AsyncOpenAI
 from redis.asyncio import Redis as AsyncRedis
 
+from app.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,12 @@ class OpenAIClient:
         max_batch_size: int = 2048,
         max_parallel_llm_calls: int = 10,
         enable_web_search: bool = False,
+        circuit_breaker_enabled: bool = True,
+        circuit_breaker_failure_threshold: float = 0.5,
+        circuit_breaker_time_window_seconds: int = 60,
+        circuit_breaker_open_duration_seconds: int = 30,
+        circuit_breaker_success_threshold: float = 0.8,
+        circuit_breaker_half_open_max_calls: int = 5,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key)
         self._max_llm_calls = max_llm_calls
@@ -36,6 +44,29 @@ class OpenAIClient:
         self._max_parallel_llm_calls = max_parallel_llm_calls
         self._enable_web_search = enable_web_search
         self._llm_semaphore = asyncio.Semaphore(max_parallel_llm_calls)
+        
+        # Initialize circuit breakers if enabled
+        self._circuit_breaker_enabled = circuit_breaker_enabled
+        if circuit_breaker_enabled:
+            self._embedding_circuit_breaker = CircuitBreaker(
+                name="openai_embeddings",
+                failure_threshold=circuit_breaker_failure_threshold,
+                time_window_seconds=circuit_breaker_time_window_seconds,
+                open_duration_seconds=circuit_breaker_open_duration_seconds,
+                success_threshold=circuit_breaker_success_threshold,
+                half_open_max_calls=circuit_breaker_half_open_max_calls,
+            )
+            self._completion_circuit_breaker = CircuitBreaker(
+                name="openai_completions",
+                failure_threshold=circuit_breaker_failure_threshold,
+                time_window_seconds=circuit_breaker_time_window_seconds,
+                open_duration_seconds=circuit_breaker_open_duration_seconds,
+                success_threshold=circuit_breaker_success_threshold,
+                half_open_max_calls=circuit_breaker_half_open_max_calls,
+            )
+        else:
+            self._embedding_circuit_breaker = None
+            self._completion_circuit_breaker = None
         
         # If web search is enabled, use search-preview model variant
         # Note: These models may require API access approval
@@ -57,11 +88,22 @@ class OpenAIClient:
             self._effective_chat_model = chat_model
 
     async def get_embedding(self, text: str) -> list[float]:
-        response = await self._client.embeddings.create(
-            model=self._embedding_model,
-            input=text,
-        )
-        return list(response.data[0].embedding)
+        """Get embedding for text, with circuit breaker protection."""
+        async def _call_api():
+            response = await self._client.embeddings.create(
+                model=self._embedding_model,
+                input=text,
+            )
+            return list(response.data[0].embedding)
+        
+        if self._circuit_breaker_enabled and self._embedding_circuit_breaker:
+            try:
+                return await self._embedding_circuit_breaker.call(_call_api)
+            except CircuitBreakerOpenError:
+                logger.warning("Embedding circuit breaker is OPEN. Service unavailable.")
+                raise Exception("Embedding service temporarily unavailable. Please try again later.")
+        else:
+            return await _call_api()
 
     async def get_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts in a single batch API call.
@@ -96,16 +138,26 @@ class OpenAIClient:
         max_retries = 3
         base_delay = 1.0
         
+        async def _call_api():
+            response = await self._client.embeddings.create(
+                model=self._embedding_model,
+                input=texts_to_process,
+            )
+            # Extract embeddings in order
+            embeddings = [list(item.embedding) for item in response.data]
+            logger.info("Generated %d embeddings in batch", len(embeddings))
+            return embeddings
+        
         for attempt in range(max_retries):
             try:
-                response = await self._client.embeddings.create(
-                    model=self._embedding_model,
-                    input=texts_to_process,
-                )
-                # Extract embeddings in order
-                embeddings = [list(item.embedding) for item in response.data]
-                logger.info("Generated %d embeddings in batch", len(embeddings))
-                return embeddings
+                if self._circuit_breaker_enabled and self._embedding_circuit_breaker:
+                    try:
+                        return await self._embedding_circuit_breaker.call(_call_api)
+                    except CircuitBreakerOpenError:
+                        logger.warning("Embedding circuit breaker is OPEN. Service unavailable.")
+                        raise Exception("Embedding service temporarily unavailable. Please try again later.")
+                else:
+                    return await _call_api()
             except Exception as exc:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
@@ -175,7 +227,7 @@ class OpenAIClient:
         if self._enable_web_search:
             logger.info("Web search enabled (using %s) for query: %s", model_to_use, query[:50])
 
-        try:
+        async def _call_api():
             # Build request parameters
             # Search-preview models may not support all parameters (e.g., temperature)
             request_params = {
@@ -191,29 +243,45 @@ class OpenAIClient:
             if "search-preview" not in model_to_use:
                 request_params["temperature"] = 0
             
-            response = await self._client.chat.completions.create(**request_params)
-        except Exception as exc:
-            # If search-preview model fails (e.g., not available or parameter error), fall back to regular model
-            if self._enable_web_search and "gpt-4o" in model_to_use and "search-preview" in model_to_use:
-                logger.warning(
-                    "Search-preview model %s failed (may not be available or parameter incompatibility). Falling back to %s. Error: %s",
-                    model_to_use,
-                    self._chat_model,
-                    exc,
-                )
-                # Retry with regular model (which supports temperature)
-                response = await self._client.chat.completions.create(
-                    model=self._chat_model,
-                    temperature=0,
-                    messages=[
-                        {"role": "system", "content": self._system_prompt},
-                        {"role": "user", "content": query},
-                    ],
-                )
+            try:
+                response = await self._client.chat.completions.create(**request_params)
+            except Exception as exc:
+                # If search-preview model fails (e.g., not available or parameter error), fall back to regular model
+                if self._enable_web_search and "gpt-4o" in model_to_use and "search-preview" in model_to_use:
+                    logger.warning(
+                        "Search-preview model %s failed (may not be available or parameter incompatibility). Falling back to %s. Error: %s",
+                        model_to_use,
+                        self._chat_model,
+                        exc,
+                    )
+                    # Retry with regular model (which supports temperature)
+                    response = await self._client.chat.completions.create(
+                        model=self._chat_model,
+                        temperature=0,
+                        messages=[
+                            {"role": "system", "content": self._system_prompt},
+                            {"role": "user", "content": query},
+                        ],
+                    )
+                else:
+                    raise
+            message = response.choices[0].message.content or ""
+            return message.strip()
+        
+        try:
+            if self._circuit_breaker_enabled and self._completion_circuit_breaker:
+                try:
+                    answer = await self._completion_circuit_breaker.call(_call_api)
+                    return answer, True
+                except CircuitBreakerOpenError:
+                    logger.warning("Completion circuit breaker is OPEN. Returning fallback response.")
+                    return self._fallback_response, False
             else:
-                raise
-        message = response.choices[0].message.content or ""
-        return message.strip(), True
+                answer = await _call_api()
+                return answer, True
+        except Exception as exc:
+            # Re-raise to be handled by caller
+            raise
 
     async def get_completions_batch(self, queries: list[str]) -> list[tuple[str, bool]]:
         """Generate completions for multiple queries using parallel async calls.

@@ -45,6 +45,16 @@ class Settings:
     max_parallel_llm_calls: int
     max_age_by_query_type: dict[str, int]
     enable_web_search: bool
+    # Circuit breaker settings
+    circuit_breaker_enabled: bool
+    circuit_breaker_failure_threshold: float
+    circuit_breaker_time_window_seconds: int
+    circuit_breaker_open_duration_seconds: int
+    circuit_breaker_success_threshold: float
+    circuit_breaker_half_open_max_calls: int
+    # Graceful degradation settings
+    max_concurrent_requests: int
+    request_timeout_seconds: int
 
 
 def _get_env_bool(name: str, default: bool) -> bool:
@@ -101,4 +111,14 @@ def get_settings() -> Settings:
         max_parallel_llm_calls=_get_env_int("MAX_PARALLEL_LLM_CALLS", 10),
         max_age_by_query_type=_get_env_json_dict("MAX_AGE_BY_QUERY_TYPE", default_max_ages),
         enable_web_search=_get_env_bool("ENABLE_WEB_SEARCH", False),
+        # Circuit breaker settings
+        circuit_breaker_enabled=_get_env_bool("CIRCUIT_BREAKER_ENABLED", True),
+        circuit_breaker_failure_threshold=_get_env_float("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 0.5),
+        circuit_breaker_time_window_seconds=_get_env_int("CIRCUIT_BREAKER_TIME_WINDOW_SECONDS", 60),
+        circuit_breaker_open_duration_seconds=_get_env_int("CIRCUIT_BREAKER_OPEN_DURATION_SECONDS", 30),
+        circuit_breaker_success_threshold=_get_env_float("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", 0.8),
+        circuit_breaker_half_open_max_calls=_get_env_int("CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", 5),
+        # Graceful degradation settings
+        max_concurrent_requests=_get_env_int("MAX_CONCURRENT_REQUESTS", 1000),
+        request_timeout_seconds=_get_env_int("REQUEST_TIMEOUT_SECONDS", 30),
     )

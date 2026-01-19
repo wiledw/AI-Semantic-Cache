@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis as AsyncRedis
 
@@ -22,11 +24,23 @@ from app.utils.query_classification import (
     get_max_age_for_query_type,
 )
 from app.utils.structured_logging import get_logger, log_with_context
+from app.utils.circuit_breaker import CircuitBreakerOpenError
 
 
 logger = get_logger(__name__)
 router = APIRouter()
 settings = get_settings()
+
+# Request concurrency limiter for graceful degradation
+_request_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_request_semaphore() -> asyncio.Semaphore:
+    """Get or create request semaphore for concurrency limiting."""
+    global _request_semaphore
+    if _request_semaphore is None:
+        _request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+    return _request_semaphore
 
 
 class QueryRequest(BaseModel):
@@ -91,6 +105,12 @@ async def _build_clients(embedding_model: Optional[str] = None) -> tuple[Semanti
         max_batch_size=settings.max_batch_size,
         max_parallel_llm_calls=settings.max_parallel_llm_calls,
         enable_web_search=settings.enable_web_search,
+        circuit_breaker_enabled=settings.circuit_breaker_enabled,
+        circuit_breaker_failure_threshold=settings.circuit_breaker_failure_threshold,
+        circuit_breaker_time_window_seconds=settings.circuit_breaker_time_window_seconds,
+        circuit_breaker_open_duration_seconds=settings.circuit_breaker_open_duration_seconds,
+        circuit_breaker_success_threshold=settings.circuit_breaker_success_threshold,
+        circuit_breaker_half_open_max_calls=settings.circuit_breaker_half_open_max_calls,
     )
     
     # Use connection pool for Weaviate
@@ -125,237 +145,317 @@ async def _get_stat(redis_client: AsyncRedis, key: str) -> int:
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query_endpoint(payload: QueryRequest) -> QueryResponse:
+async def query_endpoint(payload: QueryRequest, request: Request) -> QueryResponse:
     start_time = time.time()
     request_id = f"req_{int(start_time * 1000)}"
     
-    if not settings.openai_api_key:
-        log_with_context(
-            logger,
-            logging.ERROR,
-            "OPENAI_API_KEY is not set",
-            request_id=request_id,
-            operation="query",
-        )
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set.")
-
-    cache, openai_client = await _build_clients(embedding_model=payload.embeddingModel)
-    # Use shared async Redis client from connection pool
-    redis_client = await get_async_redis_client()
-    metrics = MetricsCollector(redis_client)
-    
-    query_text = payload.query.strip()
-    time_sensitive = is_time_sensitive(query_text)
-    ttl_seconds = (
-        settings.short_ttl_seconds if time_sensitive else settings.long_ttl_seconds
-    )
-    
-    # Extract query type for age-based invalidation
-    query_type = get_query_type(query_text)
-    
-    # Initial topic extraction (keyword-based, will be refined after embedding if needed)
-    topic = extract_topic_keywords(query_text)
-
-    log_with_context(
-        logger,
-        logging.INFO,
-        "Incoming query",
-        request_id=request_id,
-        operation="query",
-        time_sensitive=time_sensitive,
-        topic=topic,
-        query_type=query_type,
-        force_refresh=payload.forceRefresh,
-    )
-    await _increment_stat(redis_client, "stat:requests")
-
-    is_hit = False
-    similarity_score: Optional[float] = None
-    operation_type = "query"
-
-    # Request-level caching: Check for exact match before semantic search
-    if not payload.forceRefresh:
-        exact_match = await cache.get_exact_match(query_text, topic=topic)
-        if exact_match:
-            # Check if entry is stale before serving
-            if not cache.is_stale(exact_match, query_type):
-                latency_ms = (time.time() - start_time) * 1000
-                is_hit = True
-                similarity_score = 1.0
-                operation_type = "exact_match"
-                
-                log_with_context(
-                    logger,
-                    logging.INFO,
-                    "Exact match cache hit",
-                    request_id=request_id,
-                    operation=operation_type,
-                    hit=True,
-                    similarity=similarity_score,
-                    latency_ms=latency_ms,
-                    topic=topic,
-                )
-                
-                await _increment_stat(redis_client, "stat:cache_hits")
-                await metrics.record_request(
-                    is_hit=True,
-                    latency_ms=latency_ms,
-                    similarity=similarity_score,
-                    operation=operation_type,
-                )
-                
-                return QueryResponse(
-                    response=exact_match["response"],
-                    metadata=ResponseMetadata(source="cache", similarity=1.0),
-                )
-            else:
-                log_with_context(
-                    logger,
-                    logging.INFO,
-                    "Exact match found but entry is stale",
-                    request_id=request_id,
-                    operation="exact_match",
-                    topic=topic,
-                    query_type=query_type,
-                )
-
+    # Graceful degradation: Check concurrency limit
+    semaphore = _get_request_semaphore()
     try:
-        embedding = await cache.get_or_create_embedding(query_text)
-    except Exception as exc:
+        # Try to acquire semaphore with timeout
+        await asyncio.wait_for(semaphore.acquire(), timeout=0.1)
+    except asyncio.TimeoutError:
+        # Too many concurrent requests - return 503 Service Unavailable
         latency_ms = (time.time() - start_time) * 1000
-        log_with_context(
-            logger,
-            logging.ERROR,
-            "Embedding generation failed",
-            request_id=request_id,
-            operation="embedding",
-            latency_ms=latency_ms,
-            exception=str(exc),
-        )
-        raise HTTPException(status_code=502, detail="Embedding service failure.")
-    
-    # Refine topic using hybrid approach (embedding fallback if keyword extraction returned "general")
-    if topic == "general":
-        topic = await extract_topic_hybrid(query_text, query_embedding=embedding, redis_client=redis_client)
-
-    if not payload.forceRefresh:
-        # Use custom threshold if provided, otherwise use default
-        threshold = payload.similarityThreshold if payload.similarityThreshold is not None else settings.similarity_threshold
-        entry, similarity = await cache.find_similar(
-            embedding,
-            threshold=threshold,
-            topic=topic,
-            query_type=query_type,
-        )
-        if entry:
-            # Note: is_stale() is already checked in find_similar(), but double-check for safety
-            if not cache.is_stale(entry, query_type):
-                latency_ms = (time.time() - start_time) * 1000
-                is_hit = True
-                similarity_score = similarity
-                operation_type = "semantic_search"
-                
-                log_with_context(
-                    logger,
-                    logging.INFO,
-                    "Cache hit with similarity",
-                    request_id=request_id,
-                    operation=operation_type,
-                    hit=True,
-                    similarity=similarity_score,
-                    latency_ms=latency_ms,
-                    topic=topic,
-                    query_type=query_type,
-                )
-                
-                await _increment_stat(redis_client, "stat:cache_hits")
-                await metrics.record_request(
-                    is_hit=True,
-                    latency_ms=latency_ms,
-                    similarity=similarity_score,
-                    operation=operation_type,
-                )
-                
-                return QueryResponse(
-                    response=entry["response"],
-                    metadata=ResponseMetadata(source="cache", similarity=similarity),
-                )
-            else:
-                log_with_context(
-                    logger,
-                    logging.INFO,
-                    "Similar entry found but is stale",
-                    request_id=request_id,
-                    operation="semantic_search",
-                    similarity=similarity,
-                    topic=topic,
-                    query_type=query_type,
-                )
-        
-        similarity_score = similarity
-        operation_type = "semantic_search"
-        log_with_context(
-            logger,
-            logging.INFO,
-            "Cache miss",
-            request_id=request_id,
-            operation=operation_type,
-            miss=True,
-            similarity=similarity_score,
-        )
-        await _increment_stat(redis_client, "stat:cache_misses")
-    else:
-        await _increment_stat(redis_client, "stat:cache_misses")
-
-    try:
-        answer, used_llm = await openai_client.get_completion(query_text)
-    except Exception as exc:
-        latency_ms = (time.time() - start_time) * 1000
-        log_with_context(
-            logger,
-            logging.ERROR,
-            "LLM call failed",
-            request_id=request_id,
-            operation="llm_call",
-            latency_ms=latency_ms,
-            exception=str(exc),
-        )
-        raise HTTPException(status_code=502, detail="LLM service failure.")
-
-    if used_llm:
-        await cache.store_response(query_text, embedding, answer, ttl_seconds, topic=topic)
-        log_with_context(
-            logger,
-            logging.INFO,
-            "Stored response in cache",
-            request_id=request_id,
-            operation="store_response",
-            ttl_seconds=ttl_seconds,
-            topic=topic,
-        )
-    else:
-        await _increment_stat(redis_client, "stat:llm_fallbacks")
         log_with_context(
             logger,
             logging.WARNING,
-            "Fallback response returned due to LLM call cap",
+            "Request rejected due to concurrency limit",
             request_id=request_id,
-            operation="fallback",
+            operation="query",
+            latency_ms=latency_ms,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Service temporarily overloaded. Please try again in a moment.",
+                "retry_after": 5,
+            },
+            headers={"Retry-After": "5"},
+        )
+    
+    try:
+        if not settings.openai_api_key:
+            log_with_context(
+                logger,
+                logging.ERROR,
+                "OPENAI_API_KEY is not set",
+                request_id=request_id,
+                operation="query",
+            )
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set.")
+
+        cache, openai_client = await _build_clients(embedding_model=payload.embeddingModel)
+        # Use shared async Redis client from connection pool
+        redis_client = await get_async_redis_client()
+        metrics = MetricsCollector(redis_client)
+        
+        query_text = payload.query.strip()
+        time_sensitive = is_time_sensitive(query_text)
+        ttl_seconds = (
+            settings.short_ttl_seconds if time_sensitive else settings.long_ttl_seconds
+        )
+        
+        # Extract query type for age-based invalidation
+        query_type = get_query_type(query_text)
+        
+        # Initial topic extraction (keyword-based, will be refined after embedding if needed)
+        topic = extract_topic_keywords(query_text)
+
+        log_with_context(
+            logger,
+            logging.INFO,
+            "Incoming query",
+            request_id=request_id,
+            operation="query",
+            time_sensitive=time_sensitive,
+            topic=topic,
+            query_type=query_type,
+            force_refresh=payload.forceRefresh,
+        )
+        await _increment_stat(redis_client, "stat:requests")
+
+        is_hit = False
+        similarity_score: Optional[float] = None
+        operation_type = "query"
+
+        # Request-level caching: Check for exact match before semantic search
+        if not payload.forceRefresh:
+            exact_match = await cache.get_exact_match(query_text, topic=topic)
+            if exact_match:
+                # Check if entry is stale before serving
+                if not cache.is_stale(exact_match, query_type):
+                    latency_ms = (time.time() - start_time) * 1000
+                    is_hit = True
+                    similarity_score = 1.0
+                    operation_type = "exact_match"
+                    
+                    log_with_context(
+                        logger,
+                        logging.INFO,
+                        "Exact match cache hit",
+                        request_id=request_id,
+                        operation=operation_type,
+                        hit=True,
+                        similarity=similarity_score,
+                        latency_ms=latency_ms,
+                        topic=topic,
+                    )
+                    
+                    await _increment_stat(redis_client, "stat:cache_hits")
+                    await metrics.record_request(
+                        is_hit=True,
+                        latency_ms=latency_ms,
+                        similarity=similarity_score,
+                        operation=operation_type,
+                    )
+                    
+                    return QueryResponse(
+                        response=exact_match["response"],
+                        metadata=ResponseMetadata(source="cache", similarity=1.0),
+                    )
+                else:
+                    log_with_context(
+                        logger,
+                        logging.INFO,
+                        "Exact match found but entry is stale",
+                        request_id=request_id,
+                        operation="exact_match",
+                        topic=topic,
+                        query_type=query_type,
+                    )
+
+        try:
+            embedding = await cache.get_or_create_embedding(query_text)
+        except CircuitBreakerOpenError:
+            # Circuit breaker is open - return graceful error
+            latency_ms = (time.time() - start_time) * 1000
+            log_with_context(
+                logger,
+                logging.WARNING,
+                "Embedding service unavailable (circuit breaker open)",
+                request_id=request_id,
+                operation="embedding",
+                latency_ms=latency_ms,
+            )
+            # Return fallback response instead of error
+            await _increment_stat(redis_client, "stat:cache_misses")
+            await metrics.record_request(
+                is_hit=False,
+                latency_ms=latency_ms,
+                similarity=None,
+                operation="embedding_circuit_open",
+            )
+            return QueryResponse(
+                response="Service temporarily unavailable. Please try again later.",
+                metadata=ResponseMetadata(source="fallback"),
+            )
+        except Exception as exc:
+            latency_ms = (time.time() - start_time) * 1000
+            log_with_context(
+                logger,
+                logging.ERROR,
+                "Embedding generation failed",
+                request_id=request_id,
+                operation="embedding",
+                latency_ms=latency_ms,
+                exception=str(exc),
+            )
+            # Return graceful error instead of 502
+            await _increment_stat(redis_client, "stat:cache_misses")
+            await metrics.record_request(
+                is_hit=False,
+                latency_ms=latency_ms,
+                similarity=None,
+                operation="embedding_error",
+            )
+            return QueryResponse(
+                response="Unable to process query at this time. Please try again later.",
+                metadata=ResponseMetadata(source="error"),
+            )
+        
+        # Refine topic using hybrid approach (embedding fallback if keyword extraction returned "general")
+        if topic == "general":
+            topic = await extract_topic_hybrid(query_text, query_embedding=embedding, redis_client=redis_client)
+
+        if not payload.forceRefresh:
+            # Use custom threshold if provided, otherwise use default
+            threshold = payload.similarityThreshold if payload.similarityThreshold is not None else settings.similarity_threshold
+            entry, similarity = await cache.find_similar(
+                embedding,
+                threshold=threshold,
+                topic=topic,
+                query_type=query_type,
+            )
+            if entry:
+                # Note: is_stale() is already checked in find_similar(), but double-check for safety
+                if not cache.is_stale(entry, query_type):
+                    latency_ms = (time.time() - start_time) * 1000
+                    is_hit = True
+                    similarity_score = similarity
+                    operation_type = "semantic_search"
+                    
+                    log_with_context(
+                        logger,
+                        logging.INFO,
+                        "Cache hit with similarity",
+                        request_id=request_id,
+                        operation=operation_type,
+                        hit=True,
+                        similarity=similarity_score,
+                        latency_ms=latency_ms,
+                        topic=topic,
+                        query_type=query_type,
+                    )
+                    
+                    await _increment_stat(redis_client, "stat:cache_hits")
+                    await metrics.record_request(
+                        is_hit=True,
+                        latency_ms=latency_ms,
+                        similarity=similarity_score,
+                        operation=operation_type,
+                    )
+                    
+                    return QueryResponse(
+                        response=entry["response"],
+                        metadata=ResponseMetadata(source="cache", similarity=similarity),
+                    )
+                else:
+                    log_with_context(
+                        logger,
+                        logging.INFO,
+                        "Similar entry found but is stale",
+                        request_id=request_id,
+                        operation="semantic_search",
+                        similarity=similarity,
+                        topic=topic,
+                        query_type=query_type,
+                    )
+            
+            similarity_score = similarity
+            operation_type = "semantic_search"
+            log_with_context(
+                logger,
+                logging.INFO,
+                "Cache miss",
+                request_id=request_id,
+                operation=operation_type,
+                miss=True,
+                similarity=similarity_score,
+            )
+            await _increment_stat(redis_client, "stat:cache_misses")
+        else:
+            await _increment_stat(redis_client, "stat:cache_misses")
+
+        try:
+            answer, used_llm = await openai_client.get_completion(query_text)
+        except CircuitBreakerOpenError:
+            # Circuit breaker is open - fallback response already returned by client
+            latency_ms = (time.time() - start_time) * 1000
+            log_with_context(
+                logger,
+                logging.WARNING,
+                "LLM service unavailable (circuit breaker open)",
+                request_id=request_id,
+                operation="llm_call",
+                latency_ms=latency_ms,
+            )
+            # Client already returned fallback response
+            answer = openai_client._fallback_response
+            used_llm = False
+        except Exception as exc:
+            latency_ms = (time.time() - start_time) * 1000
+            log_with_context(
+                logger,
+                logging.ERROR,
+                "LLM call failed",
+                request_id=request_id,
+                operation="llm_call",
+                latency_ms=latency_ms,
+                exception=str(exc),
+            )
+            # Return graceful error instead of raising 502
+            answer = "Unable to generate response at this time. Please try again later."
+            used_llm = False
+            await _increment_stat(redis_client, "stat:llm_fallbacks")
+
+        if used_llm:
+            await cache.store_response(query_text, embedding, answer, ttl_seconds, topic=topic)
+            log_with_context(
+                logger,
+                logging.INFO,
+                "Stored response in cache",
+                request_id=request_id,
+                operation="store_response",
+                ttl_seconds=ttl_seconds,
+                topic=topic,
+            )
+        else:
+            await _increment_stat(redis_client, "stat:llm_fallbacks")
+            log_with_context(
+                logger,
+                logging.WARNING,
+                "Fallback response returned due to LLM call cap",
+                request_id=request_id,
+                operation="fallback",
+            )
+
+        latency_ms = (time.time() - start_time) * 1000
+        await metrics.record_request(
+            is_hit=False,
+            latency_ms=latency_ms,
+            similarity=similarity_score,
+            operation=operation_type,
         )
 
-    latency_ms = (time.time() - start_time) * 1000
-    await metrics.record_request(
-        is_hit=False,
-        latency_ms=latency_ms,
-        similarity=similarity_score,
-        operation=operation_type,
-    )
-
-    source = openai_client.chat_model if used_llm else "fallback"
-    return QueryResponse(
-        response=answer,
-        metadata=ResponseMetadata(source=source),
-    )
+        source = openai_client.chat_model if used_llm else "fallback"
+        return QueryResponse(
+            response=answer,
+            metadata=ResponseMetadata(source=source),
+        )
+    finally:
+        # Always release semaphore
+        semaphore.release()
 
 
 @router.get("/stats", response_model=StatsResponse)
