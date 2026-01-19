@@ -2,7 +2,7 @@
 
 ## System Overview
 
-<img width="1526" height="1700" alt="image" src="https://github.com/user-attachments/assets/25de4bff-6ec8-4dc1-8c0c-0405ba985bd5" />
+<img width="954" height="1800" alt="image" src="https://github.com/user-attachments/assets/0eca498e-d9ea-47ce-8f25-34f17c15b1e8" />
 
 This service provides a semantic caching layer for an AI-powered query API. It uses OpenAI embeddings to identify semantically similar queries and serves cached responses from Redis when similarity is above a configurable threshold. If no cache hit exists (or `forceRefresh=true`), it calls the LLM, caches the result, and returns the response.
 
