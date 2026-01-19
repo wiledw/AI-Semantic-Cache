@@ -93,9 +93,8 @@ export default function App() {
 
   const fetchMetrics = async () => {
     try {
-      // Use smaller interval (10 seconds) for better granularity
-      // This allows multiple requests per interval, showing intermediate hit rates
-      const response = await fetch(`${METRICS_URL}?hours=1&interval_seconds=10`);
+      // Use 5-minute intervals for hit rate to cost graph
+      const response = await fetch(`${METRICS_URL}?hours=1&interval_seconds=300`);
       if (!response.ok) {
         console.warn('Metrics fetch failed:', response.status, response.statusText);
         return;
@@ -282,7 +281,7 @@ export default function App() {
               {metrics.data && metrics.data.length > 0 ? (
                 <>
                   <p style={styles.chartDescription}>
-                    Showing cumulative hit rate and total requests over time (10-second intervals). As more queries are cached, the cumulative hit rate should increase. The request count accumulates over time.
+                    Showing cumulative hit rate and total requests over time (5-minute intervals). As more queries are cached, the cumulative hit rate should increase. The request count accumulates over time.
                   </p>
                   <ResponsiveContainer width="100%" height={300}>
                     <LineChart data={metrics.data}>
