@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
-from app.utils.connection_pool import get_redis_client, get_weaviate_client, close_connections
+from app.utils.connection_pool import get_redis_client, get_async_redis_client, get_weaviate_client, close_connections
 
 
 logging.basicConfig(
@@ -24,7 +24,8 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize connection pools
     logger.info("Initializing connection pools...")
     try:
-        get_redis_client()  # Initialize Redis connection pool
+        get_redis_client()  # Initialize synchronous Redis connection pool (for backward compatibility)
+        await get_async_redis_client()  # Initialize async Redis connection pool
         get_weaviate_client()  # Initialize Weaviate client if enabled
         logger.info("Connection pools initialized successfully")
     except Exception as exc:
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown: Close all connections
     logger.info("Closing connection pools...")
-    close_connections()
+    await close_connections()
     logger.info("Connection pools closed")
 
 

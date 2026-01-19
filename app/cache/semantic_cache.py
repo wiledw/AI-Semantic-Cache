@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 import weaviate
 from weaviate.classes.query import MetadataQuery
 
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class SemanticCache:
     def __init__(
         self,
-        redis_client: Redis,
+        redis_client: AsyncRedis,
         openai_client: OpenAIClient,
         similarity_threshold: float,
         embedding_cache_ttl_seconds: int,
@@ -34,38 +34,38 @@ class SemanticCache:
         self._weaviate = weaviate_client
         self._use_weaviate = use_weaviate and weaviate_client is not None
 
-    def get_or_create_embedding(self, query: str) -> list[float]:
+    async def get_or_create_embedding(self, query: str) -> list[float]:
         # Use enhanced preprocessing to normalize query for better cache matching
         normalized = normalize_query(query, enhanced=True)
         # Include embedding model in cache key to avoid conflicts between models
-        model_name = self._openai._embedding_model
+        model_name = self._openai.embedding_model
         embed_key = f"embed:{model_name}:{self._hash_text(normalized)}"
-        cached = self._redis.get(embed_key)
+        cached = await self._redis.get(embed_key)
         if cached:
             return json.loads(cached)
 
         # Generate embedding from normalized query to maximize similarity matching
         # This ensures similar queries produce similar embeddings
-        embedding = self._openai.get_embedding(normalized)
-        self._redis.set(
+        embedding = await self._openai.get_embedding(normalized)
+        await self._redis.set(
             embed_key,
             json.dumps(embedding),
             ex=self._embedding_cache_ttl_seconds,
         )
         return embedding
 
-    def find_similar(self, query_embedding: list[float], threshold: Optional[float] = None) -> tuple[Optional[dict], float]:
+    async def find_similar(self, query_embedding: list[float], threshold: Optional[float] = None) -> tuple[Optional[dict], float]:
         """Find similar cached entry. Optionally override threshold for testing."""
         threshold_to_use = threshold if threshold is not None else self._threshold
         
         # Use Weaviate if enabled and available
         if self._use_weaviate:
-            return self._find_similar_weaviate(query_embedding, threshold_to_use)
+            return await self._find_similar_weaviate(query_embedding, threshold_to_use)
         
         # Fallback to linear scan
-        return self._find_similar_linear(query_embedding, threshold_to_use)
+        return await self._find_similar_linear(query_embedding, threshold_to_use)
     
-    def _find_similar_weaviate(self, query_embedding: list[float], threshold: float) -> tuple[Optional[dict], float]:
+    async def _find_similar_weaviate(self, query_embedding: list[float], threshold: float) -> tuple[Optional[dict], float]:
         """Find similar cached entry using Weaviate vector search."""
         try:
             collection = self._weaviate.collections.get("SemanticCache")
@@ -78,10 +78,15 @@ class SemanticCache:
             max_distance = 1.0 - threshold
             
             # Query Weaviate for nearest vector
-            result = collection.query.near_vector(
-                near_vector=query_embedding,
-                limit=1,
-                return_metadata=MetadataQuery(distance=True),
+            # Note: Weaviate client operations are synchronous, but we're in an async context
+            # We'll run them in a thread pool to avoid blocking
+            import asyncio
+            result = await asyncio.to_thread(
+                lambda: collection.query.near_vector(
+                    near_vector=query_embedding,
+                    limit=1,
+                    return_metadata=MetadataQuery(distance=True),
+                )
             )
             
             if result.objects and len(result.objects) > 0:
@@ -103,17 +108,17 @@ class SemanticCache:
             return None, 0.0
         except Exception as exc:
             logger.warning("Weaviate search failed, falling back to linear scan: %s", exc)
-            return self._find_similar_linear(query_embedding, threshold)
+            return await self._find_similar_linear(query_embedding, threshold)
     
-    def _find_similar_linear(self, query_embedding: list[float], threshold: float) -> tuple[Optional[dict], float]:
+    async def _find_similar_linear(self, query_embedding: list[float], threshold: float) -> tuple[Optional[dict], float]:
         """Find similar cached entry using linear scan (original implementation)."""
         best_entry = None
         best_score = 0.0
-        cache_keys = list(self._redis.smembers("cache_keys"))
+        cache_keys = await self._redis.smembers("cache_keys")
         for key in cache_keys:
-            payload = self._redis.get(key)
+            payload = await self._redis.get(key)
             if not payload:
-                self._redis.srem("cache_keys", key)
+                await self._redis.srem("cache_keys", key)
                 continue
             entry = json.loads(payload)
             score = cosine_similarity(query_embedding, entry["embedding"])
@@ -125,7 +130,7 @@ class SemanticCache:
             return best_entry, best_score
         return None, best_score
 
-    def store_response(
+    async def store_response(
         self,
         query: str,
         embedding: list[float],
@@ -143,13 +148,13 @@ class SemanticCache:
             "created_at": created_at,
             "ttl_seconds": ttl_seconds,
         }
-        self._redis.set(cache_key, json.dumps(entry), ex=ttl_seconds)
-        self._redis.sadd("cache_keys", cache_key)
+        await self._redis.set(cache_key, json.dumps(entry), ex=ttl_seconds)
+        await self._redis.sadd("cache_keys", cache_key)
         
         # Also store in Weaviate if enabled
         if self._use_weaviate:
             try:
-                self._store_response_weaviate(
+                await self._store_response_weaviate(
                     query=query,
                     embedding=embedding,
                     response=response,
@@ -163,7 +168,7 @@ class SemanticCache:
         
         logger.info("Cached response under %s for %ss", cache_key, ttl_seconds)
     
-    def _store_response_weaviate(
+    async def _store_response_weaviate(
         self,
         query: str,
         embedding: list[float],
@@ -183,15 +188,19 @@ class SemanticCache:
         else:
             created_at_dt = dt.fromisoformat(created_at)
         
-        collection.data.insert(
-            properties={
-                "query_text": query,
-                "response": response,
-                "created_at": created_at_dt,
-                "ttl_seconds": ttl_seconds,
-                "cache_key": cache_key,
-            },
-            vector=embedding,
+        # Run Weaviate insert in thread pool to avoid blocking
+        import asyncio
+        await asyncio.to_thread(
+            lambda: collection.data.insert(
+                properties={
+                    "query_text": query,
+                    "response": response,
+                    "created_at": created_at_dt,
+                    "ttl_seconds": ttl_seconds,
+                    "cache_key": cache_key,
+                },
+                vector=embedding,
+            )
         )
 
     @staticmethod

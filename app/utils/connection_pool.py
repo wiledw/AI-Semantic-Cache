@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 from redis import Redis, ConnectionPool
+from redis.asyncio import Redis as AsyncRedis, ConnectionPool as AsyncConnectionPool
 import weaviate
 
 from app.utils.config import get_settings
@@ -13,12 +14,14 @@ logger = logging.getLogger(__name__)
 # Module-level connection pools (singletons)
 _redis_pool: Optional[ConnectionPool] = None
 _redis_client: Optional[Redis] = None
+_async_redis_pool: Optional[AsyncConnectionPool] = None
+_async_redis_client: Optional[AsyncRedis] = None
 _weaviate_client: Optional[weaviate.WeaviateClient] = None
 _settings = get_settings()
 
 
 def get_redis_client() -> Redis:
-    """Get or create a shared Redis client with connection pooling."""
+    """Get or create a shared synchronous Redis client with connection pooling."""
     global _redis_client, _redis_pool
     
     if _redis_client is None:
@@ -33,6 +36,24 @@ def get_redis_client() -> Redis:
         logger.info("Created Redis connection pool")
     
     return _redis_client
+
+
+async def get_async_redis_client() -> AsyncRedis:
+    """Get or create a shared async Redis client with connection pooling."""
+    global _async_redis_client, _async_redis_pool
+    
+    if _async_redis_client is None:
+        # Create async connection pool for Redis
+        _async_redis_pool = AsyncConnectionPool.from_url(
+            _settings.redis_url,
+            decode_responses=True,
+            max_connections=50,  # Maximum connections in pool
+            retry_on_timeout=True,
+        )
+        _async_redis_client = AsyncRedis(connection_pool=_async_redis_pool)
+        logger.info("Created async Redis connection pool")
+    
+    return _async_redis_client
 
 
 def get_weaviate_client() -> Optional[weaviate.WeaviateClient]:
@@ -79,9 +100,9 @@ def get_weaviate_client() -> Optional[weaviate.WeaviateClient]:
     return _weaviate_client
 
 
-def close_connections() -> None:
+async def close_connections() -> None:
     """Close all connections. Useful for cleanup/shutdown."""
-    global _redis_client, _redis_pool, _weaviate_client
+    global _redis_client, _redis_pool, _async_redis_client, _async_redis_pool, _weaviate_client
     
     if _redis_client:
         try:
@@ -100,6 +121,24 @@ def close_connections() -> None:
             logger.warning("Error closing Redis pool: %s", exc)
         finally:
             _redis_pool = None
+    
+    if _async_redis_client:
+        try:
+            await _async_redis_client.aclose()
+            logger.info("Closed async Redis client")
+        except Exception as exc:
+            logger.warning("Error closing async Redis client: %s", exc)
+        finally:
+            _async_redis_client = None
+    
+    if _async_redis_pool:
+        try:
+            await _async_redis_pool.aclose()
+            logger.info("Closed async Redis connection pool")
+        except Exception as exc:
+            logger.warning("Error closing async Redis pool: %s", exc)
+        finally:
+            _async_redis_pool = None
     
     if _weaviate_client:
         try:
