@@ -8,9 +8,9 @@ from pydantic import BaseModel, Field
 from redis import Redis
 
 from app.cache.semantic_cache import SemanticCache
-from app.cache.weaviate_schema import get_weaviate_client
 from app.llm.openai_client import OpenAIClient
 from app.utils.config import get_settings
+from app.utils.connection_pool import get_redis_client, get_weaviate_client
 from app.utils.query_classification import is_time_sensitive
 
 
@@ -48,7 +48,9 @@ class StatsResponse(BaseModel):
 
 
 def _build_clients(embedding_model: Optional[str] = None) -> tuple[SemanticCache, OpenAIClient]:
-    redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+    # Use connection pool for Redis
+    redis_client = get_redis_client()
+    
     openai_client = OpenAIClient(
         api_key=settings.openai_api_key,
         max_llm_calls=settings.max_llm_calls,
@@ -58,16 +60,8 @@ def _build_clients(embedding_model: Optional[str] = None) -> tuple[SemanticCache
         embedding_model=embedding_model or "text-embedding-3-small",
     )
     
-    # Initialize Weaviate client if enabled
-    weaviate_client = None
-    if settings.use_weaviate:
-        try:
-            weaviate_client = get_weaviate_client(
-                url=settings.weaviate_url,
-                api_key=settings.weaviate_api_key if settings.weaviate_api_key else None,
-            )
-        except Exception as exc:
-            logger.warning("Failed to connect to Weaviate, falling back to linear scan: %s", exc)
+    # Use connection pool for Weaviate
+    weaviate_client = get_weaviate_client()
     
     cache = SemanticCache(
         redis_client=redis_client,
@@ -102,7 +96,8 @@ def query_endpoint(payload: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set.")
 
     cache, openai_client = _build_clients(embedding_model=payload.embeddingModel)
-    redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+    # Use shared Redis client from connection pool
+    redis_client = get_redis_client()
     query_text = payload.query.strip()
     time_sensitive = is_time_sensitive(query_text)
     ttl_seconds = (
@@ -159,7 +154,8 @@ def query_endpoint(payload: QueryRequest) -> QueryResponse:
 
 @router.get("/stats", response_model=StatsResponse)
 def stats_endpoint() -> StatsResponse:
-    redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+    # Use shared Redis client from connection pool
+    redis_client = get_redis_client()
     requests = _get_stat(redis_client, "stat:requests")
     cache_hits = _get_stat(redis_client, "stat:cache_hits")
     cache_misses = _get_stat(redis_client, "stat:cache_misses")

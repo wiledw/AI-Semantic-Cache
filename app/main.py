@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
+from app.utils.connection_pool import get_redis_client, get_weaviate_client, close_connections
 
 
 logging.basicConfig(
@@ -15,7 +17,28 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Boardy Semantic Cache")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan: initialize connections on startup, cleanup on shutdown."""
+    # Startup: Initialize connection pools
+    logger.info("Initializing connection pools...")
+    try:
+        get_redis_client()  # Initialize Redis connection pool
+        get_weaviate_client()  # Initialize Weaviate client if enabled
+        logger.info("Connection pools initialized successfully")
+    except Exception as exc:
+        logger.error("Failed to initialize connection pools: %s", exc)
+    
+    yield
+    
+    # Shutdown: Close all connections
+    logger.info("Closing connection pools...")
+    close_connections()
+    logger.info("Connection pools closed")
+
+
+app = FastAPI(title="Boardy Semantic Cache", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
