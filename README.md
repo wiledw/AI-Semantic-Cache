@@ -28,23 +28,38 @@ This service provides a semantic caching layer for an AI-powered query API. It u
 Client
   |
   v
-FastAPI (/api/query)
+FastAPI API Layer (/api/query, /api/stats, /api/metrics)
   | \
-  |  \-> OpenAI LLM (gpt-4o-mini / gpt-4o-search-preview)
+  |  \-> Structured Logging (JSON)
+  |  \-> Metrics Collector (counters + time series)
   v
-Semantic Cache
-  | \
-  |  \-> OpenAI Embeddings (text-embedding-3-small)
-  v
-Query Classification
-  | \
-  |  \-> Topic Extraction (keywords + embeddings)
-  |  \-> Query Type Detection (for age-based invalidation)
-  v
-Storage Layer
-  | \
-  |  \-> Redis (responses + embeddings + metrics + TTL + topic partitions)
-  |  \-> Weaviate (optional vector database with topic filtering)
+Query Pipeline
+  |
+  +--> Request-Level Cache (exact match)
+  |        |
+  |        +--> Redis (cache:<topic>:<hash>)
+  |
+  +--> Query Classification
+  |        |
+  |        +--> Topic Extraction (keywords + embedding fallback)
+  |        +--> Query Type Detection (time-sensitive)
+  |
+  +--> Embedding Service
+  |        |
+  |        +--> OpenAI Embeddings (text-embedding-3-small)
+  |        +--> Redis Embedding Cache (embed:<model>:<hash>)
+  |
+  +--> Semantic Cache Lookup
+           |
+           +--> Weaviate (optional vector search + topic filter)
+           +--> Redis Linear Scan (topic partition + fallback global scan)
+           |
+           +--> Staleness Check (min(TTL, max_age_by_query_type))
+           |
+           +--> Cache Miss Path
+                    |
+                    +--> OpenAI LLM (gpt-4o-mini / gpt-4o-search-preview)
+                    +--> Store Response (Redis + optional Weaviate)
 ```
 
 **Cache Flow**:
