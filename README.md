@@ -62,6 +62,14 @@ Query Pipeline
                     +--> Store Response (Redis + optional Weaviate)
 ```
 
+**Architecture design decisions (why this shape)**:
+- **Fast API layer with observability**: Logging + metrics are first-class so cache behavior is measurable.
+- **Exact-match before semantic**: Cheapest, lowest-latency hit path.
+- **Topic classification before vector search**: Reduces cross-domain false positives and narrows search space.
+- **Embedding cache**: Avoids repeated embedding costs for repeated/normalized queries.
+- **Dual storage**: Redis for TTL + counters; optional Weaviate for scalable vector search.
+- **Staleness gate**: `min(TTL, max_age_by_domain)` prevents serving outdated responses.
+
 **Cache Flow**:
 1. Query is classified into a topic and query type
 2. Cache lookup is scoped to the topic partition
@@ -76,6 +84,15 @@ Query Pipeline
 - **Preprocessing**: Enhanced query normalization for better cache matching
 
 If the best cached entry is above the threshold and not expired, the cached response is returned.
+
+### Model & Threshold Rationale (Semantic Cache Review.pdf)
+
+Based on the experiments documented in `Semantic Cache Review.pdf`:
+
+- **Model choice**: `text-embedding-3-small` showed the most predictable, conservative reuse behavior with safer cost savings than `text-embedding-ada-002` (too aggressive) and `text-embedding-3-large` (too conservative).
+- **Thresholds are model-specific**: Similarity distributions vary by model, so optimal thresholds differ. For example, `ada-002` produces higher and wider similarity scores than the 3-series models.
+- **Empirical sweet spot**: On the evaluated dataset, a threshold around **0.75–0.80** with preprocessing balanced acceptability and hit rate. The repo default remains `0.85` as a safer baseline, and should be tuned per workload.
+- **Preprocessing impact**: Removing semantic “noise” (e.g., greetings or filler phrases) measurably improved hit rates for `3-small` without sacrificing answer acceptability.
 
 ## Caching Strategy & TTL Logic
 
