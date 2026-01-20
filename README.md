@@ -1,4 +1,4 @@
-# Boardy Semantic Cache Service
+# Semantic Cache Service
 
 ## System Overview
 
