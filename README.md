@@ -6,6 +6,9 @@
 
 This service provides a semantic caching layer for an AI-powered query API. It uses OpenAI embeddings to identify semantically similar queries and serves cached responses from Redis when similarity is above a configurable threshold. If no cache hit exists (or `forceRefresh=true`), it calls the LLM, caches the result, and returns the response.
 
+- **Demo video**: [Google Drive](https://drive.google.com/file/d/1vdficdTHpQ65bbIH7LH8j_aOqveYtrDG/view?usp=sharing)
+- **Semantic Cache Review**: [`Semantic Cache Review.pdf`](Semantic%20Cache%20Review.pdf)
+
 ## Features
 
 - **Semantic Caching**: Uses cosine similarity on embeddings to match semantically similar queries
